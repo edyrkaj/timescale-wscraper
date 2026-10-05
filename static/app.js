@@ -48,17 +48,203 @@ const DEFAULT_PATTERN = {
 patternConfig.value = JSON.stringify(DEFAULT_PATTERN, null, 2);
 
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  return toIsoDate(new Date());
 }
 
 function daysAgoIso(n) {
   const d = new Date();
   d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  return toIsoDate(d);
+}
+
+const MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+let openPickerClose = null;
+
+function parseIsoDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s || "")) return null;
+  const [y, m, d] = s.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
+  return dt;
+}
+
+function toIsoDate(dt) {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function yearRange() {
+  const y = new Date().getFullYear();
+  return { min: y - 10, max: y + 1 };
+}
+
+function initDatePicker(input) {
+  const wrap = input.closest(".date-field");
+  if (!wrap || wrap.querySelector(".date-picker")) return;
+
+  let lastValid = input.value;
+  const popup = document.createElement("div");
+  popup.className = "date-picker";
+  popup.innerHTML = `
+    <div class="date-picker-header">
+      <button type="button" data-nav="-1" aria-label="Previous month">‹</button>
+      <select data-month></select>
+      <select data-year></select>
+      <button type="button" data-nav="1" aria-label="Next month">›</button>
+    </div>
+    <div class="date-picker-weekdays">${WEEKDAYS.map((w) => `<span>${w}</span>`).join("")}</div>
+    <div class="date-picker-grid"></div>`;
+  wrap.appendChild(popup);
+
+  const monthSel = popup.querySelector("[data-month]");
+  const yearSel = popup.querySelector("[data-year]");
+  const grid = popup.querySelector(".date-picker-grid");
+  const { min, max } = yearRange();
+  MONTHS.forEach((name, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = name;
+    monthSel.appendChild(opt);
+  });
+  for (let y = min; y <= max; y++) {
+    const opt = document.createElement("option");
+    opt.value = String(y);
+    opt.textContent = String(y);
+    yearSel.appendChild(opt);
+  }
+
+  let view = parseIsoDate(input.value) || new Date();
+
+  function close() {
+    popup.classList.remove("is-open");
+    if (openPickerClose === close) openPickerClose = null;
+  }
+
+  function open() {
+    if (openPickerClose && openPickerClose !== close) openPickerClose();
+    view = parseIsoDate(input.value) || new Date();
+    lastValid = parseIsoDate(input.value) ? input.value : lastValid;
+    render();
+    popup.classList.add("is-open");
+    openPickerClose = close;
+  }
+
+  function clampView() {
+    let y = view.getFullYear();
+    let m = view.getMonth();
+    if (y < min) { y = min; m = 0; }
+    if (y > max) { y = max; m = 11; }
+    view = new Date(y, m, 1);
+  }
+
+  function render() {
+    clampView();
+    monthSel.value = String(view.getMonth());
+    yearSel.value = String(view.getFullYear());
+    const selected = parseIsoDate(input.value);
+    const year = view.getFullYear();
+    const month = view.getMonth();
+    const first = new Date(year, month, 1);
+    const startPad = (first.getDay() + 6) % 7;
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const cells = [];
+    for (let i = 0; i < startPad; i++) {
+      cells.push(`<button type="button" class="date-picker-day is-outside" disabled tabindex="-1"></button>`);
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+      const iso = toIsoDate(new Date(year, month, d));
+      const sel = selected && toIsoDate(selected) === iso ? " is-selected" : "";
+      cells.push(`<button type="button" class="date-picker-day${sel}" data-day="${d}">${d}</button>`);
+    }
+    grid.innerHTML = cells.join("");
+  }
+
+  monthSel.addEventListener("change", () => {
+    view = new Date(Number(yearSel.value), Number(monthSel.value), 1);
+    render();
+  });
+  yearSel.addEventListener("change", () => {
+    view = new Date(Number(yearSel.value), Number(monthSel.value), 1);
+    render();
+  });
+  popup.querySelectorAll("[data-nav]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const delta = Number(btn.dataset.nav);
+      view = new Date(view.getFullYear(), view.getMonth() + delta, 1);
+      render();
+    });
+  });
+  grid.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-day]");
+    if (!btn) return;
+    const d = Number(btn.dataset.day);
+    const next = new Date(view.getFullYear(), view.getMonth(), d);
+    input.value = toIsoDate(next);
+    lastValid = input.value;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    close();
+  });
+
+  // Avoid input blur-restore racing day clicks; allow selects to focus normally
+  popup.addEventListener("mousedown", (e) => {
+    if (e.target.closest("select")) return;
+    e.preventDefault();
+  });
+
+  const toggle = wrap.querySelector(".date-picker-toggle");
+  if (toggle) {
+    toggle.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (popup.classList.contains("is-open")) close();
+      else open();
+    });
+  }
+
+  // Typing is free; only validate when leaving the field
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      close();
+      return;
+    }
+    // Keep typing uninterrupted — close calendar if open
+    if (popup.classList.contains("is-open") && e.key.length === 1) close();
+  });
+  input.addEventListener("blur", () => {
+    const parsed = parseIsoDate(input.value.trim());
+    if (parsed) {
+      input.value = toIsoDate(parsed);
+      lastValid = input.value;
+    } else if (input.value.trim() === "") {
+      // leave empty so HTML required can catch it on submit
+      lastValid = "";
+    } else {
+      input.value = lastValid;
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!popup.classList.contains("is-open")) return;
+    if (wrap.contains(e.target)) return;
+    close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && popup.classList.contains("is-open")) close();
+  });
 }
 
 document.getElementById("to_date").value = todayIso();
 document.getElementById("from_date").value = daysAgoIso(30);
+initDatePicker(document.getElementById("from_date"));
+initDatePicker(document.getElementById("to_date"));
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();

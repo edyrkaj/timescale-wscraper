@@ -94,6 +94,7 @@ impl Db {
     pub async fn save_items(&self, items: &[ScrapedItem]) -> Result<u64> {
         let mut saved = 0u64;
         for item in items {
+            let description = item.description.as_ref().map(|d| encode_description(d));
             let result = sqlx::query(
                 r#"
                 INSERT INTO scraped_items
@@ -117,7 +118,7 @@ impl Db {
             .bind(&item.company)
             .bind(&item.location)
             .bind(&item.salary)
-            .bind(&item.description)
+            .bind(&description)
             .execute(&self.pool)
             .await?;
             saved += result.rows_affected();
@@ -387,5 +388,66 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
+    }
+}
+
+/// Strip HTML tags, decode entities to Unicode, collapse whitespace, truncate.
+fn encode_description(raw: &str) -> String {
+    let stripped = strip_html_tags(raw);
+    let decoded = html_escape::decode_html_entities(&stripped);
+    decoded
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(4000)
+        .collect()
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for c in input.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_description_strips_tags_and_decodes_entities() {
+        let raw = "<p>Hello &amp; <b>world</b></p>";
+        assert_eq!(encode_description(raw), "Hello & world");
+    }
+
+    #[test]
+    fn encode_description_decodes_albanian_entities() {
+        let raw = "Kryen pun&euml;n specifike t&euml; nj&euml;sis&euml; organizative&nbsp;opsione";
+        let encoded = encode_description(raw);
+        assert_eq!(
+            encoded,
+            "Kryen punën specifike të njësisë organizative opsione"
+        );
+    }
+}
+
+#[cfg(test)]
+mod entity_debug {
+    #[test]
+    fn show_decode() {
+        for c in ["pun&euml;n", "pun&amp;euml;n", "pun&Euml;n"] {
+            let once = html_escape::decode_html_entities(c);
+            let twice = html_escape::decode_html_entities(once.as_ref());
+            println!("{c} => once={once} twice={twice}");
+            assert!(twice.contains('ë') || twice.contains('Ë'), "failed on {c}");
+        }
     }
 }

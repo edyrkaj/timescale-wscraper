@@ -28,11 +28,17 @@
         <div class="row">
           <label>
             From date
-            <input id="from_date" name="from_date" type="date" required />
+            <span class="date-field">
+              <input id="from_date" name="from_date" type="text" inputmode="numeric" placeholder="YYYY-MM-DD" required autocomplete="off" />
+              <button type="button" class="date-picker-toggle" aria-label="Open from date calendar">▾</button>
+            </span>
           </label>
           <label>
             To date
-            <input id="to_date" name="to_date" type="date" required />
+            <span class="date-field">
+              <input id="to_date" name="to_date" type="text" inputmode="numeric" placeholder="YYYY-MM-DD" required autocomplete="off" />
+              <button type="button" class="date-picker-toggle" aria-label="Open to date calendar">▾</button>
+            </span>
           </label>
         </div>
         <div class="actions">
