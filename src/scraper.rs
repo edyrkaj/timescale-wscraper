@@ -333,7 +333,15 @@ where
 fn strip_html(input: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap_or_else(|_| Regex::new(r"a^").unwrap());
     let text = re.replace_all(input, " ");
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut decoded = text.into_owned();
+    for _ in 0..5 {
+        let next = html_escape::decode_html_entities(&decoded);
+        if next.as_ref() == decoded.as_str() {
+            break;
+        }
+        decoded = next.into_owned();
+    }
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn collect_from_api(
@@ -479,6 +487,7 @@ async fn collect_from_dom(
         .item_link_regex
         .as_ref()
         .and_then(|r| Regex::new(r).ok());
+    let use_cards = dom.card_selector.as_ref().is_some_and(|s| !s.is_empty());
 
     while stats.pages_visited < MAX_PAGES && items.len() < MAX_ITEMS as usize {
         if cancel.is_cancelled() {
@@ -491,7 +500,6 @@ async fn collect_from_dom(
         tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
 
         if let Some(sel) = &dom.wait_for {
-            // soft wait: poll for selector presence
             for _ in 0..20 {
                 let present: bool = page
                     .evaluate(format!(
@@ -509,47 +517,119 @@ async fn collect_from_dom(
             }
         }
 
-        let selector = dom
-            .item_link_selector
-            .clone()
-            .unwrap_or_else(|| "a[href]".into());
+        if use_cards {
+            let cfg = serde_json::json!({
+                "card": dom.card_selector,
+                "title": dom.title_selector,
+                "company": dom.company_selector,
+                "location": dom.location_selector,
+                "date": dom.date_selector,
+            });
+            let cards: Vec<DomCardExtract> = page
+                .evaluate(format!(
+                    r#"
+                    (() => {{
+                      const cfg = {cfg};
+                      const text = (el) => (el && (el.innerText || el.textContent) || '').trim();
+                      return [...document.querySelectorAll(cfg.card)].map((card) => {{
+                        const titleEl = cfg.title ? card.querySelector(cfg.title) : null;
+                        const companyEl = cfg.company ? card.querySelector(cfg.company) : null;
+                        const locationEl = cfg.location ? card.querySelector(cfg.location) : null;
+                        const dateEl = cfg.date ? card.querySelector(cfg.date) : null;
+                        return {{
+                          url: titleEl && titleEl.href ? titleEl.href : null,
+                          title: text(titleEl) || null,
+                          company: text(companyEl) || null,
+                          location: text(locationEl) || null,
+                          dateText: text(dateEl) || null
+                        }};
+                      }}).filter((row) => row.url);
+                    }})()
+                    "#,
+                    cfg = cfg
+                ))
+                .await?
+                .into_value()
+                .unwrap_or_default();
 
-        let hrefs: Vec<String> = page
-            .evaluate(format!(
-                r#"
-                (() => {{
-                  const sel = {sel};
-                  return [...document.querySelectorAll(sel)]
-                    .map(a => a.href)
-                    .filter(Boolean);
-                }})()
-                "#,
-                sel = serde_json::to_string(&selector).unwrap()
-            ))
-            .await?
-            .into_value()
-            .unwrap_or_default();
-
-        for href in hrefs {
-            if let Some(re) = &link_re {
-                if !re.is_match(&href) {
+            for card in cards {
+                let href = match card.url {
+                    Some(u) if !u.is_empty() => u,
+                    _ => continue,
+                };
+                if let Some(re) = &link_re {
+                    if !re.is_match(&href) {
+                        continue;
+                    }
+                }
+                if !seen.insert(href.clone()) {
                     continue;
                 }
+                let ts = card
+                    .date_text
+                    .as_deref()
+                    .and_then(parse_date_from_text)
+                    .map(date_to_utc)
+                    .unwrap_or_else(Utc::now);
+                let title = card
+                    .title
+                    .filter(|t| t.len() >= 2)
+                    .unwrap_or_else(|| "Untitled job".into());
+                items.push(ScrapedItem {
+                    source_id: source_id.to_string(),
+                    external_id: external_id_for_url(&href),
+                    item_timestamp: ts,
+                    title: title.chars().take(300).collect(),
+                    url: href,
+                    company: card.company.filter(|s| !s.is_empty()),
+                    location: card.location.filter(|s| !s.is_empty()),
+                    salary: None,
+                    description: None,
+                });
             }
-            if !seen.insert(href.clone()) {
-                continue;
+        } else {
+            let selector = dom
+                .item_link_selector
+                .clone()
+                .unwrap_or_else(|| "a[href]".into());
+
+            let hrefs: Vec<String> = page
+                .evaluate(format!(
+                    r#"
+                    (() => {{
+                      const sel = {sel};
+                      return [...document.querySelectorAll(sel)]
+                        .map(a => a.href)
+                        .filter(Boolean);
+                    }})()
+                    "#,
+                    sel = serde_json::to_string(&selector).unwrap()
+                ))
+                .await?
+                .into_value()
+                .unwrap_or_default();
+
+            for href in hrefs {
+                if let Some(re) = &link_re {
+                    if !re.is_match(&href) {
+                        continue;
+                    }
+                }
+                if !seen.insert(href.clone()) {
+                    continue;
+                }
+                items.push(ScrapedItem {
+                    source_id: source_id.to_string(),
+                    external_id: external_id_for_url(&href),
+                    item_timestamp: Utc::now(),
+                    title: "Untitled job".into(),
+                    url: href,
+                    company: None,
+                    location: None,
+                    salary: None,
+                    description: None,
+                });
             }
-            items.push(ScrapedItem {
-                source_id: source_id.to_string(),
-                external_id: external_id_for_url(&href),
-                item_timestamp: Utc::now(),
-                title: "Untitled job".into(),
-                url: href,
-                company: None,
-                location: None,
-                salary: None,
-                description: None,
-            });
         }
 
         let next_sel = match &dom.next_page_selector {
@@ -579,13 +659,22 @@ async fn collect_from_dom(
             Some(h) if h != "clicked" && h != current => current = h,
             Some(_) => {
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                // stay on same SPA url after click
             }
             None => break,
         }
     }
 
     Ok(items)
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct DomCardExtract {
+    url: Option<String>,
+    title: Option<String>,
+    company: Option<String>,
+    location: Option<String>,
+    #[serde(rename = "dateText")]
+    date_text: Option<String>,
 }
 
 async fn enrich_from_detail_page(
@@ -933,7 +1022,8 @@ fn parse_json_date(v: &Value) -> Option<NaiveDate> {
 }
 
 fn parse_slash_date(s: &str) -> Option<NaiveDate> {
-    let re = Regex::new(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b").ok()?;
+    // Albanian boards use DD/MM/YYYY or DD-MM-YYYY
+    let re = Regex::new(r"\b(\d{1,2})[/-](\d{1,2})[/-](20\d{2})\b").ok()?;
     let caps = re.captures(s)?;
     let a: u32 = caps.get(1)?.as_str().parse().ok()?;
     let b: u32 = caps.get(2)?.as_str().parse().ok()?;
@@ -1059,4 +1149,15 @@ fn parse_date_from_text(text: &str) -> Option<NaiveDate> {
 
 fn date_to_utc(d: NaiveDate) -> DateTime<Utc> {
     Utc.from_utc_datetime(&d.and_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_duapune_hyphen_dates() {
+        let d = parse_slash_date("02-11-2026").expect("date");
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 11, 2).unwrap());
+    }
 }

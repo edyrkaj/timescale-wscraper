@@ -88,6 +88,47 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
+        let duapune_config = serde_json::json!({
+            "list": {
+                "source": "dom",
+                "dom": {
+                    "wait_for": "div.job-listing",
+                    "wait_ms": 3000,
+                    "card_selector": "div.job-listing",
+                    "title_selector": "h1.job-title > a",
+                    "company_selector": "h1.job-title small a",
+                    "location_selector": "span.location",
+                    "date_selector": "span.time",
+                    "item_link_regex": "/jobs/\\d+"
+                }
+            },
+            "detail": {
+                "source": "none"
+            }
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
+            VALUES (
+                'a2222222-2222-4222-8222-222222222222',
+                'DuaPune listing',
+                'duapune.com',
+                $1::jsonb,
+                TRUE
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                config = EXCLUDED.config,
+                url_match = EXCLUDED.url_match,
+                name = EXCLUDED.name,
+                enabled = TRUE,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(duapune_config)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -391,10 +432,11 @@ impl Db {
     }
 }
 
-/// Strip HTML tags, decode entities to Unicode, collapse whitespace, truncate.
+/// Strip HTML tags, decode entities to Unicode (repeat for double-encoding),
+/// collapse whitespace, truncate.
 fn encode_description(raw: &str) -> String {
     let stripped = strip_html_tags(raw);
-    let decoded = html_escape::decode_html_entities(&stripped);
+    let decoded = decode_entities_fully(&stripped);
     decoded
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -402,6 +444,20 @@ fn encode_description(raw: &str) -> String {
         .chars()
         .take(4000)
         .collect()
+}
+
+/// Decode HTML entities until stable. Needed because some sources store
+/// double-encoded text (`&amp;euml;` → `&euml;` → `ë`).
+fn decode_entities_fully(input: &str) -> String {
+    let mut current = input.to_string();
+    for _ in 0..5 {
+        let next = html_escape::decode_html_entities(&current);
+        if next.as_ref() == current.as_str() {
+            break;
+        }
+        current = next.into_owned();
+    }
+    current
 }
 
 fn strip_html_tags(input: &str) -> String {
@@ -437,17 +493,11 @@ mod tests {
             "Kryen punën specifike të njësisë organizative opsione"
         );
     }
-}
 
-#[cfg(test)]
-mod entity_debug {
     #[test]
-    fn show_decode() {
-        for c in ["pun&euml;n", "pun&amp;euml;n", "pun&Euml;n"] {
-            let once = html_escape::decode_html_entities(c);
-            let twice = html_escape::decode_html_entities(once.as_ref());
-            println!("{c} => once={once} twice={twice}");
-            assert!(twice.contains('ë') || twice.contains('Ë'), "failed on {c}");
-        }
+    fn encode_description_decodes_double_encoded_entities() {
+        // One decode leaves &euml;; we must decode again.
+        let raw = "pun&amp;euml;n";
+        assert_eq!(encode_description(raw), "punën");
     }
 }

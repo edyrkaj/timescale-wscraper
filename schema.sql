@@ -80,3 +80,28 @@ VALUES (
     TRUE
 )
 ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
+VALUES (
+    'a2222222-2222-4222-8222-222222222222',
+    'DuaPune listing',
+    'duapune.com',
+    '{
+      "list": {
+        "source": "dom",
+        "dom": {
+          "wait_for": "div.job-listing",
+          "wait_ms": 3000,
+          "card_selector": "div.job-listing",
+          "title_selector": "h1.job-title > a",
+          "company_selector": "h1.job-title small a",
+          "location_selector": "span.location",
+          "date_selector": "span.time",
+          "item_link_regex": "/jobs/\\d+"
+        }
+      },
+      "detail": { "source": "none" }
+    }'::jsonb,
+    TRUE
+)
+ON CONFLICT (id) DO NOTHING;

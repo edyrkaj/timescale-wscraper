@@ -143,7 +143,19 @@ pub struct DomListConfig {
     pub wait_for: Option<String>,
     #[serde(default)]
     pub wait_ms: Option<u64>,
-    /// CSS selector for anchors that point to detail pages
+    /// CSS selector for each job card on the listing page
+    #[serde(default)]
+    pub card_selector: Option<String>,
+    /// Within a card: job title + detail link (preferred over item_link_selector)
+    #[serde(default)]
+    pub title_selector: Option<String>,
+    #[serde(default)]
+    pub company_selector: Option<String>,
+    #[serde(default)]
+    pub location_selector: Option<String>,
+    #[serde(default)]
+    pub date_selector: Option<String>,
+    /// CSS selector for anchors that point to detail pages (link-only mode)
     #[serde(default)]
     pub item_link_selector: Option<String>,
     /// Regex applied to hrefs if selector not enough
