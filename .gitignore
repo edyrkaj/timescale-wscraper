@@ -1,0 +1,5 @@
+/target
+.cargo-home/
+**/*.rs.bk
+.env
+.DS_Store

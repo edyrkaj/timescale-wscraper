@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Timescale Job Scraper</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <h1>Timescale Job Scraper</h1>
+      <p>Enqueue a listing URL, scrape with Chromium, store jobs in TimescaleDB.</p>
+    </header>
+
+    <section class="controls">
+      <form id="scrape-form">
+        <label>
+          Website / listing URL
+          <input id="url" name="url" type="url" required placeholder="https://example.com/jobs" />
+        </label>
+        <div class="row">
+          <label>
+            From date
+            <input id="from_date" name="from_date" type="date" required />
+          </label>
+          <label>
+            To date
+            <input id="to_date" name="to_date" type="date" required />
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit" id="start-btn">Start scraping</button>
+          <button type="button" id="stop-btn" class="secondary" disabled>Stop</button>
+          <button type="button" id="restart-btn" class="secondary" disabled>Restart</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="progress-panel">
+      <div class="progress-meta">
+        <span id="status-label">Idle</span>
+        <span id="counters">Queue: 0 · Scraped: 0</span>
+      </div>
+      <div class="progress-track" aria-hidden="true">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="message" class="message">Waiting for a job…</p>
+    </section>
+
+    <section class="lists">
+      <div>
+        <h2>Jobs</h2>
+        <ul id="jobs"></ul>
+      </div>
+      <div>
+        <h2>Recent items</h2>
+        <ul id="items"></ul>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

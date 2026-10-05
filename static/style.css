@@ -1,0 +1,198 @@
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+:root {
+  --bg0: #0f1c17;
+  --bg1: #1a3228;
+  --ink: #e8f2ec;
+  --muted: #9bb5a8;
+  --accent: #3dd68c;
+  --accent-dim: #1f8f5a;
+  --danger: #ff6b6b;
+  --card: rgba(255, 255, 255, 0.04);
+  --line: rgba(232, 242, 236, 0.12);
+  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  font-family: var(--font-body);
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #245c43 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #163528 0%, transparent 50%),
+    linear-gradient(160deg, var(--bg0), var(--bg1));
+}
+
+.shell {
+  width: min(920px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2.5rem 0 4rem;
+}
+
+.brand h1 {
+  margin: 0 0 0.4rem;
+  font-family: var(--font-display);
+  font-size: clamp(2rem, 5vw, 3rem);
+  letter-spacing: -0.02em;
+}
+
+.brand p {
+  margin: 0 0 1.75rem;
+  color: var(--muted);
+}
+
+.controls, .progress-panel, .lists > div {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+  backdrop-filter: blur(8px);
+}
+
+form {
+  display: grid;
+  gap: 1rem;
+}
+
+label {
+  display: grid;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+input {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 0.75rem 0.9rem;
+  font: inherit;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.7rem 1.2rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--accent), var(--accent-dim));
+  color: #04140c;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+  font-weight: 500;
+}
+
+.progress-track {
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 8%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent), #9bffc9);
+  background-size: 200% 100%;
+  transition: width 0.35s ease;
+}
+
+.progress-bar.active {
+  animation: slide 1.2s linear infinite, pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes slide {
+  from { background-position: 0% 0; }
+  to { background-position: 200% 0; }
+}
+
+@keyframes pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.25); }
+}
+
+.message {
+  margin: 0.85rem 0 0;
+  color: var(--muted);
+  min-height: 1.25rem;
+}
+
+.lists {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.lists h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-family: var(--font-display);
+}
+
+ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.55rem;
+  max-height: 320px;
+  overflow: auto;
+}
+
+li {
+  border-top: 1px solid var(--line);
+  padding-top: 0.55rem;
+  font-size: 0.88rem;
+}
+
+li .meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+li.selected {
+  outline: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.45rem;
+}
+
+@media (max-width: 720px) {
+  .row, .lists { grid-template-columns: 1fr; }
+}
