@@ -25,6 +25,10 @@ pub struct BrowserPool {
 }
 
 impl BrowserPool {
+    pub async fn try_launch() -> Result<Self> {
+        Self::launch().await
+    }
+
     pub async fn launch() -> Result<Self> {
         let chrome = std::env::var("CHROME_PATH").unwrap_or_else(|_| {
             [
@@ -68,7 +72,7 @@ impl BrowserPool {
 }
 
 pub async fn scrape_listing<F, Fut>(
-    browser: Arc<Browser>,
+    browser: Option<Arc<Browser>>,
     listing_url: &str,
     from_date: NaiveDate,
     to_date: NaiveDate,
@@ -80,15 +84,74 @@ where
     F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    if let Some(cfg) = pattern {
+    let inferred;
+    let cfg = match pattern {
+        Some(c) => Some(c),
+        None => {
+            inferred = infer_erekrutim_pattern(listing_url);
+            inferred.as_ref()
+        }
+    };
+
+    if let Some(cfg) = cfg {
+        info!("using pattern-based scrape (API/DOM)");
         return scrape_with_pattern(browser, listing_url, from_date, to_date, cfg, cancel, on_batch)
             .await;
     }
+
+    let browser = browser.context("no scrape pattern matched and Chromium is unavailable")?;
     scrape_heuristic(browser, listing_url, from_date, to_date, cancel, on_batch).await
 }
 
+/// Build an API list pattern for Albanian e-rekrutim style `/shpalljet` portals.
+pub fn infer_erekrutim_pattern(listing_url: &str) -> Option<PatternConfig> {
+    let parsed = Url::parse(listing_url).ok()?;
+    let host = parsed.host_str()?.to_lowercase();
+    let path = parsed.path().to_lowercase();
+    if !path.contains("shpalljet") && !host.contains("rekrutimi") {
+        return None;
+    }
+    // Prefer hosts that look like the known Angular e-rekrutim apps
+    if !(host.contains("rekrutimi") || path.contains("shpalljet")) {
+        return None;
+    }
+
+    let origin = format!("{}://{}", parsed.scheme(), parsed.host_str()?);
+    Some(PatternConfig {
+        list: crate::models::ListConfig {
+            source: ListSource::Api,
+            api: Some(ApiListConfig {
+                url_template: format!(
+                    "{origin}/api/api/Job/public-announcements?PageNumber={{page}}&PageSize={{page_size}}"
+                ),
+                page_size: 50,
+                items_path: "$".into(),
+                id_path: "id".into(),
+                published_at_path: Some("job.0.publishedDate".into()),
+                title_path: Some("job.0.jobPositionsResponse.0.positionName".into()),
+                company_path: None,
+                company_literal: Some(host.clone()),
+                location_path: Some("job.0.jobPositionsResponse.0.organisationalUnit".into()),
+                salary_path: Some("job.0.jobPositionsResponse.0.categoryName".into()),
+                description_path: None,
+                detail_url_template: Some(format!("{origin}/shpalljet/{{id}}")),
+            }),
+            dom: None,
+        },
+        detail: Some(DetailConfig {
+            source: DetailSource::Api,
+            wait_ms: None,
+            api_url_template: Some(format!(
+                "{origin}/api/api/Job/get-positions-by-job/{{id}}"
+            )),
+            description_path: Some("0.positionDescription".into()),
+            fields: Default::default(),
+        }),
+    })
+}
+
 async fn scrape_with_pattern<F, Fut>(
-    browser: Arc<Browser>,
+    browser: Option<Arc<Browser>>,
     listing_url: &str,
     from_date: NaiveDate,
     to_date: NaiveDate,
@@ -103,7 +166,7 @@ where
     let source_id = source_id_from_url(listing_url)?;
     let mut stats = ScrapeStats::default();
 
-    let candidates = match pattern.list.source {
+    let mut candidates = match pattern.list.source {
         ListSource::Api => {
             let api = pattern
                 .list
@@ -113,76 +176,142 @@ where
             collect_from_api(api, &source_id, from_date, to_date, &cancel, &mut stats).await?
         }
         ListSource::Dom => {
+            let browser = browser.clone().context("DOM scrape requires Chromium")?;
             let dom = pattern
                 .list
                 .dom
                 .as_ref()
                 .context("pattern list.source=dom but dom config missing")?;
-            collect_from_dom(
-                browser.clone(),
-                listing_url,
-                dom,
-                &source_id,
-                &cancel,
-                &mut stats,
-            )
-            .await?
+            collect_from_dom(browser, listing_url, dom, &source_id, &cancel, &mut stats).await?
         }
     };
 
-    // Apply detail enrichment when configured
-    if let Some(detail) = &pattern.detail {
-        if matches!(detail.source, DetailSource::Page) {
-            let page = browser.new_page("about:blank").await?;
-            let mut enriched = Vec::new();
-            for mut item in candidates {
-                if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
-                    break;
-                }
-                match enrich_from_detail_page(&page, &mut item, detail).await {
-                    Ok(()) => {}
-                    Err(err) => warn!(error = %err, url = %item.url, "detail enrich failed"),
-                }
+    info!(count = candidates.len(), "list candidates collected");
 
-                let d = item.item_timestamp.date_naive();
-                if d < from_date {
-                    continue;
-                }
-                if d > to_date {
-                    // keep if date came from scrape-now fallback? Prefer drop when parseable out of range
-                    // We can't distinguish easily; if detail set a real date outside range, skip.
-                    // Heuristic: if older than from or newer than to after enrichment, skip when not "today" only for future.
-                    if d > to_date {
+    if let Some(detail) = &pattern.detail {
+        match detail.source {
+            DetailSource::Page => {
+                let browser = browser.context("detail.source=page requires Chromium")?;
+                let page = browser.new_page("about:blank").await?;
+                let mut enriched = Vec::new();
+                for mut item in candidates {
+                    if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
+                        break;
+                    }
+                    if let Err(err) = enrich_from_detail_page(&page, &mut item, detail).await {
+                        warn!(error = %err, url = %item.url, "detail enrich failed");
+                    }
+                    let d = item.item_timestamp.date_naive();
+                    if d < from_date || d > to_date {
                         continue;
                     }
+                    enriched.push(item);
+                    if enriched.len() >= 10 {
+                        let batch_len = enriched.len() as i32;
+                        stats.scraped_count += batch_len;
+                        on_batch(
+                            std::mem::take(&mut enriched),
+                            stats.scraped_count,
+                            stats.pages_visited,
+                        )
+                        .await?;
+                    }
                 }
-
-                enriched.push(item);
-                if enriched.len() >= 10 {
+                if !enriched.is_empty() {
                     let batch_len = enriched.len() as i32;
                     stats.scraped_count += batch_len;
-                    on_batch(std::mem::take(&mut enriched), stats.scraped_count, stats.pages_visited)
-                        .await?;
+                    on_batch(enriched, stats.scraped_count, stats.pages_visited).await?;
                 }
+                return Ok(stats);
             }
-            if !enriched.is_empty() {
-                let batch_len = enriched.len() as i32;
-                stats.scraped_count += batch_len;
-                on_batch(enriched, stats.scraped_count, stats.pages_visited).await?;
+            DetailSource::Api => {
+                let client = reqwest::Client::builder()
+                    .user_agent("timescale-wscraper/0.1")
+                    .build()?;
+                let template = detail
+                    .api_url_template
+                    .as_ref()
+                    .context("detail.source=api requires api_url_template")?;
+                let desc_path = detail
+                    .description_path
+                    .clone()
+                    .unwrap_or_else(|| "0.positionDescription".into());
+
+                let mut enriched = Vec::new();
+                for mut item in candidates {
+                    if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
+                        break;
+                    }
+                    // Extract id from detail URL path last segment
+                    let id = item
+                        .url
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let url = template.replace("{id}", &id);
+                    match client.get(&url).send().await {
+                        Ok(res) if res.status().is_success() => {
+                            if let Ok(body) = res.json::<Value>().await {
+                                if let Some(desc) = json_path_string(&body, &desc_path) {
+                                    let plain = strip_html(&desc);
+                                    if !plain.is_empty() {
+                                        item.description = Some(plain.chars().take(4000).collect());
+                                    }
+                                }
+                                // Prefer richer title from positionName + branch when present
+                                if let Some(name) = json_path_string(&body, "0.positionName") {
+                                    let branch = json_path_string(&body, "0.positionBranch")
+                                        .unwrap_or_default();
+                                    if !name.is_empty() {
+                                        item.title = if branch.is_empty() {
+                                            name
+                                        } else {
+                                            format!("{name}, {branch}")
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        Ok(res) => warn!(status = %res.status(), %url, "detail API non-success"),
+                        Err(err) => warn!(error = %err, %url, "detail API failed"),
+                    }
+
+                    let d = item.item_timestamp.date_naive();
+                    if d < from_date || d > to_date {
+                        continue;
+                    }
+                    enriched.push(item);
+                    if enriched.len() >= 10 {
+                        let batch_len = enriched.len() as i32;
+                        stats.scraped_count += batch_len;
+                        on_batch(
+                            std::mem::take(&mut enriched),
+                            stats.scraped_count,
+                            stats.pages_visited,
+                        )
+                        .await?;
+                    }
+                }
+                if !enriched.is_empty() {
+                    let batch_len = enriched.len() as i32;
+                    stats.scraped_count += batch_len;
+                    on_batch(enriched, stats.scraped_count, stats.pages_visited).await?;
+                }
+                return Ok(stats);
             }
-            return Ok(stats);
+            DetailSource::None => {}
         }
     }
 
-    // No detail page: filter by date and save
+    // No detail enrichment: save list candidates (already date-filtered in API path)
     let mut batch = Vec::new();
-    for item in candidates {
+    for item in candidates.drain(..) {
         if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
             break;
         }
         let d = item.item_timestamp.date_naive();
         if d < from_date || d > to_date {
-            // allow undated? API usually has publishedDate
             continue;
         }
         batch.push(item);
@@ -199,6 +328,12 @@ where
     }
 
     Ok(stats)
+}
+
+fn strip_html(input: &str) -> String {
+    let re = Regex::new(r"<[^>]+>").unwrap_or_else(|_| Regex::new(r"a^").unwrap());
+    let text = re.replace_all(input, " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 async fn collect_from_api(

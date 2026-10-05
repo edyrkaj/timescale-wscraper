@@ -5,6 +5,7 @@ Generic Docker-local job-board scraper: paste a listing URL + date range, scrape
 ## Quick start
 
 ```bash
+cp .env.example .env   # optional; defaults work out of the box
 docker compose up --build
 ```
 
@@ -12,6 +13,7 @@ Open [http://localhost:8080](http://localhost:8080).
 
 - **TimescaleDB:** `localhost:5432` — user `postgres` / password `password` / db `scrapers_db`
 - **App:** `localhost:8080`
+- **Env:** see `.env.example` (copy to `.env`; `.env` is gitignored)
 
 ## Local (without Docker app)
 

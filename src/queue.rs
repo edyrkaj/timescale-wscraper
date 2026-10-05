@@ -12,14 +12,18 @@ use crate::scraper::{self, BrowserPool};
 #[derive(Clone)]
 pub struct QueueHandle {
     db: Db,
-    browser: Arc<BrowserPool>,
+    browser: Option<Arc<BrowserPool>>,
     events: broadcast::Sender<ProgressEvent>,
     wake: watch::Sender<()>,
     cancel: Arc<Mutex<Option<(Uuid, CancellationToken)>>>,
 }
 
 impl QueueHandle {
-    pub fn new(db: Db, browser: Arc<BrowserPool>, events: broadcast::Sender<ProgressEvent>) -> Self {
+    pub fn new(
+        db: Db,
+        browser: Option<Arc<BrowserPool>>,
+        events: broadcast::Sender<ProgressEvent>,
+    ) -> Self {
         let (wake, _) = watch::channel(());
         Self {
             db,
@@ -35,7 +39,6 @@ impl QueueHandle {
     }
 
     pub async fn cancel_job(&self, id: Uuid) -> Result<()> {
-        // Mark queued jobs stopped in DB; for running, trip cancel token.
         if let Some((_, token)) = self.cancel.lock().await.as_ref().filter(|(jid, _)| *jid == id) {
             token.cancel();
         }
@@ -60,7 +63,6 @@ impl QueueHandle {
     }
 
     async fn tick(&self) -> Result<()> {
-        // Don't start another while one is tracked as cancellable/running locally
         if self.cancel.lock().await.is_some() {
             return Ok(());
         }
@@ -132,16 +134,20 @@ impl QueueHandle {
             self.db.find_pattern_for_url(&job.listing_url).await?
         };
 
-        let pattern_cfg = pattern
-            .as_ref()
-            .and_then(|p| serde_json::from_value::<crate::models::PatternConfig>(p.config.clone()).ok());
+        let pattern_cfg = pattern.as_ref().and_then(|p| {
+            serde_json::from_value::<crate::models::PatternConfig>(p.config.clone()).ok()
+        });
 
         if let Some(p) = &pattern {
             info!(pattern = %p.name, "using scrape pattern");
+        } else {
+            info!("no DB pattern; will try built-in e-rekrutim inference");
         }
 
+        let browser = self.browser.as_ref().map(|b| b.browser());
+
         let stats = scraper::scrape_listing(
-            self.browser.browser(),
+            browser,
             &job.listing_url,
             job.from_date,
             job.to_date,

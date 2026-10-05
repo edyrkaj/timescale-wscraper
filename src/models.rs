@@ -158,6 +158,11 @@ pub struct DetailConfig {
     pub source: DetailSource,
     #[serde(default)]
     pub wait_ms: Option<u64>,
+    /// e.g. https://host/api/api/Job/get-positions-by-job/{id}
+    #[serde(default)]
+    pub api_url_template: Option<String>,
+    #[serde(default)]
+    pub description_path: Option<String>,
     #[serde(default)]
     pub fields: DetailFields,
 }
@@ -166,6 +171,7 @@ pub struct DetailConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DetailSource {
     Page,
+    Api,
     None,
 }
 

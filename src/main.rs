@@ -46,8 +46,14 @@ async fn main() -> anyhow::Result<()> {
     let db = Db::new(pool);
     db.ensure_schema().await?;
 
-    info!("launching Chromium");
-    let browser = Arc::new(BrowserPool::launch().await?);
+    info!("launching Chromium (optional for API patterns)");
+    let browser = match BrowserPool::try_launch().await {
+        Ok(pool) => Some(Arc::new(pool)),
+        Err(err) => {
+            tracing::warn!(error = %err, "Chromium unavailable; API-based patterns will still work");
+            None
+        }
+    };
 
     let (events, _) = broadcast::channel::<ProgressEvent>(256);
     let queue = QueueHandle::new(db.clone(), browser, events.clone());

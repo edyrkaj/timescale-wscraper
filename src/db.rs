@@ -42,21 +42,8 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
-        // Seed Tirana pattern if missing
-        sqlx::query(
-            r#"
-            INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
-            VALUES (
-                'a1111111-1111-4111-8111-111111111111',
-                'Tirana E-rekrutim',
-                'rekrutimi.tirana.al/shpalljet',
-                $1::jsonb,
-                TRUE
-            )
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(serde_json::json!({
+        // Seed / refresh known e-rekrutim patterns (API list — no Chromium required)
+        let tirana_config = serde_json::json!({
             "list": {
                 "source": "api",
                 "api": {
@@ -73,16 +60,31 @@ impl Db {
                 }
             },
             "detail": {
-                "source": "page",
-                "wait_ms": 2500,
-                "fields": {
-                    "title_label": "Pozicioni",
-                    "company_label": "Institucioni",
-                    "description_selector": "div.card.p-3",
-                    "date_regex": "\\b(\\d{1,2}/\\d{1,2}/20\\d{2})\\b"
-                }
+                "source": "api",
+                "api_url_template": "https://rekrutimi.tirana.al/api/api/Job/get-positions-by-job/{id}",
+                "description_path": "0.positionDescription"
             }
-        }))
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
+            VALUES (
+                'a1111111-1111-4111-8111-111111111111',
+                'Tirana E-rekrutim',
+                'rekrutimi.tirana.al/shpalljet',
+                $1::jsonb,
+                TRUE
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                config = EXCLUDED.config,
+                url_match = EXCLUDED.url_match,
+                name = EXCLUDED.name,
+                enabled = TRUE,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(tirana_config)
         .execute(&self.pool)
         .await?;
 

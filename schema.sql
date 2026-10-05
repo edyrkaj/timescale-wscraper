@@ -71,16 +71,11 @@ VALUES (
           "detail_url_template": "https://rekrutimi.tirana.al/shpalljet/{id}"
         }
       },
-      "detail": {
-        "source": "page",
-        "wait_ms": 2500,
-        "fields": {
-          "title_label": "Pozicioni",
-          "company_label": "Institucioni",
-          "description_selector": "div.card.p-3",
-          "date_regex": "\\\\b(\\\\d{1,2}/\\\\d{1,2}/20\\\\d{2})\\\\b"
-        }
-      }
+            "detail": {
+                "source": "api",
+                "api_url_template": "https://rekrutimi.tirana.al/api/api/Job/get-positions-by-job/{id}",
+                "description_path": "0.positionDescription"
+            }
     }'::jsonb,
     TRUE
 )

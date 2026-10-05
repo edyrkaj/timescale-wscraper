@@ -2,4 +2,5 @@
 .cargo-home/
 **/*.rs.bk
 .env
+!.env.example
 .DS_Store
