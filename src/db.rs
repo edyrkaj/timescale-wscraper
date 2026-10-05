@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{JobStatus, ScrapeJob, ScrapedItem};
+use crate::models::{JobStatus, ScrapeJob, ScrapePattern, ScrapedItem, UpsertPatternRequest};
 
 #[derive(Clone)]
 pub struct Db {
@@ -13,6 +13,80 @@ pub struct Db {
 impl Db {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Idempotent migrations for existing Docker volumes that already ran an older schema.sql.
+    pub async fn ensure_schema(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scrape_patterns (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                url_match TEXT NOT NULL,
+                config JSONB NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE scrape_jobs
+            ADD COLUMN IF NOT EXISTS pattern_id UUID
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Seed Tirana pattern if missing
+        sqlx::query(
+            r#"
+            INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
+            VALUES (
+                'a1111111-1111-4111-8111-111111111111',
+                'Tirana E-rekrutim',
+                'rekrutimi.tirana.al/shpalljet',
+                $1::jsonb,
+                TRUE
+            )
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(serde_json::json!({
+            "list": {
+                "source": "api",
+                "api": {
+                    "url_template": "https://rekrutimi.tirana.al/api/api/Job/public-announcements?PageNumber={page}&PageSize={page_size}",
+                    "page_size": 50,
+                    "items_path": "$",
+                    "id_path": "id",
+                    "published_at_path": "job.0.publishedDate",
+                    "title_path": "job.0.jobPositionsResponse.0.positionName",
+                    "company_literal": "Bashkia Tiranë",
+                    "location_path": "job.0.jobPositionsResponse.0.organisationalUnit",
+                    "salary_path": "job.0.jobPositionsResponse.0.categoryName",
+                    "detail_url_template": "https://rekrutimi.tirana.al/shpalljet/{id}"
+                }
+            },
+            "detail": {
+                "source": "page",
+                "wait_ms": 2500,
+                "fields": {
+                    "title_label": "Pozicioni",
+                    "company_label": "Institucioni",
+                    "description_selector": "div.card.p-3",
+                    "date_regex": "\\b(\\d{1,2}/\\d{1,2}/20\\d{2})\\b"
+                }
+            }
+        }))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn save_items(&self, items: &[ScrapedItem]) -> Result<u64> {
@@ -54,12 +128,21 @@ impl Db {
         listing_url: &str,
         from_date: NaiveDate,
         to_date: NaiveDate,
+        pattern_id: Option<Uuid>,
     ) -> Result<ScrapeJob> {
         let id = Uuid::new_v4();
+        let resolved_pattern = match pattern_id {
+            Some(pid) => Some(pid),
+            None => self
+                .find_pattern_for_url(listing_url)
+                .await?
+                .map(|p| p.id),
+        };
+
         let job = sqlx::query_as::<_, ScrapeJob>(
             r#"
-            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status)
-            VALUES ($1, $2, $3, $4, 'queued')
+            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id)
+            VALUES ($1, $2, $3, $4, 'queued', $5)
             RETURNING *
             "#,
         )
@@ -67,6 +150,7 @@ impl Db {
         .bind(listing_url)
         .bind(from_date)
         .bind(to_date)
+        .bind(resolved_pattern)
         .fetch_one(&self.pool)
         .await?;
         Ok(job)
@@ -181,11 +265,10 @@ impl Db {
     }
 
     pub async fn queue_depth(&self) -> Result<i64> {
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scrape_jobs WHERE status = 'queued'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scrape_jobs WHERE status = 'queued'")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(count)
     }
 
@@ -220,5 +303,87 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
+    }
+
+    pub async fn list_patterns(&self) -> Result<Vec<ScrapePattern>> {
+        let rows = sqlx::query_as::<_, ScrapePattern>(
+            "SELECT * FROM scrape_patterns ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn get_pattern(&self, id: Uuid) -> Result<Option<ScrapePattern>> {
+        let row = sqlx::query_as::<_, ScrapePattern>("SELECT * FROM scrape_patterns WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn find_pattern_for_url(&self, url: &str) -> Result<Option<ScrapePattern>> {
+        let patterns = self.list_patterns().await?;
+        let url_l = url.to_lowercase();
+        Ok(patterns
+            .into_iter()
+            .filter(|p| p.enabled)
+            .find(|p| url_l.contains(&p.url_match.to_lowercase())))
+    }
+
+    pub async fn create_pattern(&self, req: &UpsertPatternRequest) -> Result<ScrapePattern> {
+        let id = Uuid::new_v4();
+        let config = serde_json::to_value(&req.config).context("serialize pattern config")?;
+        let row = sqlx::query_as::<_, ScrapePattern>(
+            r#"
+            INSERT INTO scrape_patterns (id, name, url_match, config, enabled)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(&req.name)
+        .bind(&req.url_match)
+        .bind(config)
+        .bind(req.enabled.unwrap_or(true))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn update_pattern(
+        &self,
+        id: Uuid,
+        req: &UpsertPatternRequest,
+    ) -> Result<Option<ScrapePattern>> {
+        let config = serde_json::to_value(&req.config).context("serialize pattern config")?;
+        let row = sqlx::query_as::<_, ScrapePattern>(
+            r#"
+            UPDATE scrape_patterns
+            SET name = $2,
+                url_match = $3,
+                config = $4,
+                enabled = $5,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(&req.name)
+        .bind(&req.url_match)
+        .bind(config)
+        .bind(req.enabled.unwrap_or(true))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn delete_pattern(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM scrape_patterns WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 }

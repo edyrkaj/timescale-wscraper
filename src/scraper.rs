@@ -4,6 +4,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
 use futures_util::StreamExt;
 use regex::Regex;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
@@ -11,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
 
-use crate::models::{ScrapeStats, ScrapedItem};
+use crate::models::{
+    ApiListConfig, DetailConfig, DetailSource, DomListConfig, ListSource, PatternConfig,
+    ScrapeStats, ScrapedItem,
+};
 
 pub const MAX_PAGES: i32 = 50;
 pub const MAX_ITEMS: i32 = 2000;
@@ -68,6 +72,502 @@ pub async fn scrape_listing<F, Fut>(
     listing_url: &str,
     from_date: NaiveDate,
     to_date: NaiveDate,
+    pattern: Option<&PatternConfig>,
+    cancel: CancellationToken,
+    on_batch: F,
+) -> Result<ScrapeStats>
+where
+    F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if let Some(cfg) = pattern {
+        return scrape_with_pattern(browser, listing_url, from_date, to_date, cfg, cancel, on_batch)
+            .await;
+    }
+    scrape_heuristic(browser, listing_url, from_date, to_date, cancel, on_batch).await
+}
+
+async fn scrape_with_pattern<F, Fut>(
+    browser: Arc<Browser>,
+    listing_url: &str,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    pattern: &PatternConfig,
+    cancel: CancellationToken,
+    mut on_batch: F,
+) -> Result<ScrapeStats>
+where
+    F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let source_id = source_id_from_url(listing_url)?;
+    let mut stats = ScrapeStats::default();
+
+    let candidates = match pattern.list.source {
+        ListSource::Api => {
+            let api = pattern
+                .list
+                .api
+                .as_ref()
+                .context("pattern list.source=api but api config missing")?;
+            collect_from_api(api, &source_id, from_date, to_date, &cancel, &mut stats).await?
+        }
+        ListSource::Dom => {
+            let dom = pattern
+                .list
+                .dom
+                .as_ref()
+                .context("pattern list.source=dom but dom config missing")?;
+            collect_from_dom(
+                browser.clone(),
+                listing_url,
+                dom,
+                &source_id,
+                &cancel,
+                &mut stats,
+            )
+            .await?
+        }
+    };
+
+    // Apply detail enrichment when configured
+    if let Some(detail) = &pattern.detail {
+        if matches!(detail.source, DetailSource::Page) {
+            let page = browser.new_page("about:blank").await?;
+            let mut enriched = Vec::new();
+            for mut item in candidates {
+                if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
+                    break;
+                }
+                match enrich_from_detail_page(&page, &mut item, detail).await {
+                    Ok(()) => {}
+                    Err(err) => warn!(error = %err, url = %item.url, "detail enrich failed"),
+                }
+
+                let d = item.item_timestamp.date_naive();
+                if d < from_date {
+                    continue;
+                }
+                if d > to_date {
+                    // keep if date came from scrape-now fallback? Prefer drop when parseable out of range
+                    // We can't distinguish easily; if detail set a real date outside range, skip.
+                    // Heuristic: if older than from or newer than to after enrichment, skip when not "today" only for future.
+                    if d > to_date {
+                        continue;
+                    }
+                }
+
+                enriched.push(item);
+                if enriched.len() >= 10 {
+                    let batch_len = enriched.len() as i32;
+                    stats.scraped_count += batch_len;
+                    on_batch(std::mem::take(&mut enriched), stats.scraped_count, stats.pages_visited)
+                        .await?;
+                }
+            }
+            if !enriched.is_empty() {
+                let batch_len = enriched.len() as i32;
+                stats.scraped_count += batch_len;
+                on_batch(enriched, stats.scraped_count, stats.pages_visited).await?;
+            }
+            return Ok(stats);
+        }
+    }
+
+    // No detail page: filter by date and save
+    let mut batch = Vec::new();
+    for item in candidates {
+        if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
+            break;
+        }
+        let d = item.item_timestamp.date_naive();
+        if d < from_date || d > to_date {
+            // allow undated? API usually has publishedDate
+            continue;
+        }
+        batch.push(item);
+        if batch.len() >= 25 {
+            let batch_len = batch.len() as i32;
+            stats.scraped_count += batch_len;
+            on_batch(std::mem::take(&mut batch), stats.scraped_count, stats.pages_visited).await?;
+        }
+    }
+    if !batch.is_empty() {
+        let batch_len = batch.len() as i32;
+        stats.scraped_count += batch_len;
+        on_batch(batch, stats.scraped_count, stats.pages_visited).await?;
+    }
+
+    Ok(stats)
+}
+
+async fn collect_from_api(
+    api: &ApiListConfig,
+    source_id: &str,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    cancel: &CancellationToken,
+    stats: &mut ScrapeStats,
+) -> Result<Vec<ScrapedItem>> {
+    let client = reqwest::Client::builder()
+        .user_agent("timescale-wscraper/0.1")
+        .build()?;
+
+    let mut items = Vec::new();
+    let mut page: u32 = 1;
+    let mut saw_older = false;
+
+    while page <= MAX_PAGES as u32 && items.len() < MAX_ITEMS as usize {
+        if cancel.is_cancelled() || saw_older {
+            break;
+        }
+        stats.pages_visited += 1;
+        let url = api
+            .url_template
+            .replace("{page}", &page.to_string())
+            .replace("{page_size}", &api.page_size.to_string());
+        info!(%url, page, "fetching pattern list API");
+
+        let body: Value = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("bad status for {url}"))?
+            .json()
+            .await
+            .context("decode list JSON")?;
+
+        let arr = json_path(&body, &api.items_path)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if arr.is_empty() {
+            break;
+        }
+
+        let arr_len = arr.len();
+        for entry in arr {
+            let id = json_path(&entry, &api.id_path)
+                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| {
+                    v.as_i64().map(|n| n.to_string())
+                }))
+                .unwrap_or_else(|| external_id_for_url(&entry.to_string()));
+
+            let published = api
+                .published_at_path
+                .as_ref()
+                .and_then(|p| json_path(&entry, p))
+                .and_then(parse_json_date);
+
+            if let Some(d) = published {
+                if d < from_date {
+                    saw_older = true;
+                    continue;
+                }
+                if d > to_date {
+                    continue;
+                }
+            }
+
+            let title = api
+                .title_path
+                .as_ref()
+                .and_then(|p| json_path_string(&entry, p))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("Job {id}"));
+
+            let company = api
+                .company_path
+                .as_ref()
+                .and_then(|p| json_path_string(&entry, p))
+                .or_else(|| api.company_literal.clone());
+
+            let location = api
+                .location_path
+                .as_ref()
+                .and_then(|p| json_path_string(&entry, p));
+            let salary = api
+                .salary_path
+                .as_ref()
+                .and_then(|p| json_path_string(&entry, p));
+            let description = api
+                .description_path
+                .as_ref()
+                .and_then(|p| json_path_string(&entry, p));
+
+            let detail_url = api
+                .detail_url_template
+                .as_ref()
+                .map(|t| t.replace("{id}", &id))
+                .unwrap_or_else(|| id.clone());
+
+            items.push(ScrapedItem {
+                source_id: source_id.to_string(),
+                external_id: external_id_for_url(&detail_url),
+                item_timestamp: published
+                    .map(date_to_utc)
+                    .unwrap_or_else(Utc::now),
+                title,
+                url: detail_url,
+                company,
+                location,
+                salary,
+                description,
+            });
+        }
+
+        if arr_len < api.page_size as usize {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(items)
+}
+
+async fn collect_from_dom(
+    browser: Arc<Browser>,
+    listing_url: &str,
+    dom: &DomListConfig,
+    source_id: &str,
+    cancel: &CancellationToken,
+    stats: &mut ScrapeStats,
+) -> Result<Vec<ScrapedItem>> {
+    let page = browser.new_page("about:blank").await?;
+    let mut current = listing_url.to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    let link_re = dom
+        .item_link_regex
+        .as_ref()
+        .and_then(|r| Regex::new(r).ok());
+
+    while stats.pages_visited < MAX_PAGES && items.len() < MAX_ITEMS as usize {
+        if cancel.is_cancelled() {
+            break;
+        }
+        stats.pages_visited += 1;
+        page.goto(&current).await?;
+        page.wait_for_navigation().await.ok();
+        let wait_ms = dom.wait_ms.unwrap_or(2000);
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+        if let Some(sel) = &dom.wait_for {
+            // soft wait: poll for selector presence
+            for _ in 0..20 {
+                let present: bool = page
+                    .evaluate(format!(
+                        "!!document.querySelector({})",
+                        serde_json::to_string(sel).unwrap()
+                    ))
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_value().ok())
+                    .unwrap_or(false);
+                if present {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+
+        let selector = dom
+            .item_link_selector
+            .clone()
+            .unwrap_or_else(|| "a[href]".into());
+
+        let hrefs: Vec<String> = page
+            .evaluate(format!(
+                r#"
+                (() => {{
+                  const sel = {sel};
+                  return [...document.querySelectorAll(sel)]
+                    .map(a => a.href)
+                    .filter(Boolean);
+                }})()
+                "#,
+                sel = serde_json::to_string(&selector).unwrap()
+            ))
+            .await?
+            .into_value()
+            .unwrap_or_default();
+
+        for href in hrefs {
+            if let Some(re) = &link_re {
+                if !re.is_match(&href) {
+                    continue;
+                }
+            }
+            if !seen.insert(href.clone()) {
+                continue;
+            }
+            items.push(ScrapedItem {
+                source_id: source_id.to_string(),
+                external_id: external_id_for_url(&href),
+                item_timestamp: Utc::now(),
+                title: "Untitled job".into(),
+                url: href,
+                company: None,
+                location: None,
+                salary: None,
+                description: None,
+            });
+        }
+
+        let next_sel = match &dom.next_page_selector {
+            Some(s) => s.clone(),
+            None => break,
+        };
+        let next_href: Option<String> = page
+            .evaluate(format!(
+                r#"
+                (() => {{
+                  const el = document.querySelector({sel});
+                  if (!el) return null;
+                  if (el.disabled || el.getAttribute('aria-disabled') === 'true') return null;
+                  if (el.href) return el.href;
+                  el.click();
+                  return 'clicked';
+                }})()
+                "#,
+                sel = serde_json::to_string(&next_sel).unwrap()
+            ))
+            .await?
+            .into_value()
+            .ok()
+            .flatten();
+
+        match next_href {
+            Some(h) if h != "clicked" && h != current => current = h,
+            Some(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                // stay on same SPA url after click
+            }
+            None => break,
+        }
+    }
+
+    Ok(items)
+}
+
+async fn enrich_from_detail_page(
+    page: &Page,
+    item: &mut ScrapedItem,
+    detail: &DetailConfig,
+) -> Result<()> {
+    page.goto(&item.url).await?;
+    page.wait_for_navigation().await.ok();
+    let wait_ms = detail.wait_ms.unwrap_or(2000);
+    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+
+    let fields = &detail.fields;
+    let payload = serde_json::json!({
+        "titleSelector": fields.title_selector,
+        "titleLabel": fields.title_label,
+        "companySelector": fields.company_selector,
+        "companyLabel": fields.company_label,
+        "locationSelector": fields.location_selector,
+        "locationLabel": fields.location_label,
+        "salarySelector": fields.salary_selector,
+        "salaryLabel": fields.salary_label,
+        "descriptionSelector": fields.description_selector,
+        "dateSelector": fields.date_selector,
+        "dateLabel": fields.date_label,
+    });
+
+    let extracted: DetailExtract = page
+        .evaluate(format!(
+            r#"
+            (() => {{
+              const cfg = {cfg};
+              const byLabel = (label) => {{
+                if (!label) return null;
+                const nodes = [...document.querySelectorAll('div, span, p, dt, th, strong, label, h1, h2, h3, h4')];
+                for (const n of nodes) {{
+                  const t = (n.innerText || '').trim();
+                  if (t === label || t.startsWith(label)) {{
+                    const sibling = n.nextElementSibling;
+                    if (sibling && (sibling.innerText || '').trim()) return sibling.innerText.trim().slice(0, 2000);
+                    const parent = n.parentElement;
+                    if (parent) {{
+                      const parts = (parent.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                      const idx = parts.findIndex(p => p === label || p.startsWith(label));
+                      if (idx >= 0 && parts[idx+1]) return parts[idx+1].slice(0, 2000);
+                    }}
+                  }}
+                }}
+                return null;
+              }};
+              const bySel = (sel) => sel ? (document.querySelector(sel)?.innerText || '').trim().slice(0, 4000) || null : null;
+              return {{
+                title: bySel(cfg.titleSelector) || byLabel(cfg.titleLabel),
+                company: bySel(cfg.companySelector) || byLabel(cfg.companyLabel),
+                location: bySel(cfg.locationSelector) || byLabel(cfg.locationLabel),
+                salary: bySel(cfg.salarySelector) || byLabel(cfg.salaryLabel),
+                description: bySel(cfg.descriptionSelector),
+                dateText: bySel(cfg.dateSelector) || byLabel(cfg.dateLabel) || document.body.innerText.slice(0, 5000)
+              }};
+            }})()
+            "#,
+            cfg = payload
+        ))
+        .await?
+        .into_value()
+        .unwrap_or_default();
+
+    if let Some(t) = extracted.title.filter(|s| s.len() >= 3) {
+        item.title = t.chars().take(300).collect();
+    }
+    if item.company.is_none() {
+        item.company = extracted.company;
+    }
+    if item.location.is_none() {
+        item.location = extracted.location;
+    }
+    if item.salary.is_none() {
+        item.salary = extracted.salary;
+    }
+    if let Some(d) = extracted.description {
+        item.description = Some(d);
+    }
+
+    let date_text = extracted.date_text.unwrap_or_default();
+    if let Some(re_s) = &fields.date_regex {
+        if let Ok(re) = Regex::new(re_s) {
+            if let Some(caps) = re.captures(&date_text) {
+                if let Some(m) = caps.get(1).or_else(|| caps.get(0)) {
+                    if let Some(d) = parse_slash_date(m.as_str()) {
+                        item.item_timestamp = date_to_utc(d);
+                    }
+                }
+            }
+        }
+    } else if let Some(d) = parse_date_from_text(&date_text) {
+        item.item_timestamp = date_to_utc(d);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailExtract {
+    title: Option<String>,
+    company: Option<String>,
+    location: Option<String>,
+    salary: Option<String>,
+    description: Option<String>,
+    date_text: Option<String>,
+}
+
+async fn scrape_heuristic<F, Fut>(
+    browser: Arc<Browser>,
+    listing_url: &str,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
     cancel: CancellationToken,
     mut on_batch: F,
 ) -> Result<ScrapeStats>
@@ -90,7 +590,16 @@ where
         stats.pages_visited += 1;
         info!(page = stats.pages_visited, url = %current_url, "visiting listing page");
 
-        match scrape_page(&page, &current_url, &source_id, &job_link_re, from_date, to_date).await {
+        match scrape_page_heuristic(
+            &page,
+            &current_url,
+            &source_id,
+            &job_link_re,
+            from_date,
+            to_date,
+        )
+        .await
+        {
             Ok((items, next_url, saw_older_than_from)) => {
                 consecutive_failures = 0;
                 if !items.is_empty() {
@@ -122,7 +631,7 @@ where
     Ok(stats)
 }
 
-async fn scrape_page(
+async fn scrape_page_heuristic(
     page: &Page,
     listing_url: &str,
     source_id: &str,
@@ -243,6 +752,61 @@ struct AnchorInfo {
     parent_text: String,
 }
 
+fn json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    if path == "$" || path.is_empty() {
+        return Some(value);
+    }
+    let mut cur = value;
+    for part in path.split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        cur = if let Ok(idx) = part.parse::<usize>() {
+            cur.as_array()?.get(idx)?
+        } else {
+            cur.get(part)?
+        };
+    }
+    Some(cur)
+}
+
+fn json_path_string(value: &Value, path: &str) -> Option<String> {
+    let v = json_path(value, path)?;
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_json_date(v: &Value) -> Option<NaiveDate> {
+    match v {
+        Value::String(s) => {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                return Some(dt.with_timezone(&Utc).date_naive());
+            }
+            if s.len() >= 10 {
+                if let Ok(d) = NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+                    return Some(d);
+                }
+            }
+            parse_slash_date(s).or_else(|| parse_date_from_text(s))
+        }
+        _ => None,
+    }
+}
+
+fn parse_slash_date(s: &str) -> Option<NaiveDate> {
+    let re = Regex::new(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b").ok()?;
+    let caps = re.captures(s)?;
+    let a: u32 = caps.get(1)?.as_str().parse().ok()?;
+    let b: u32 = caps.get(2)?.as_str().parse().ok()?;
+    let y: i32 = caps.get(3)?.as_str().parse().ok()?;
+    // DD/MM/YYYY preferred for Albanian sites
+    NaiveDate::from_ymd_opt(y, b, a).or_else(|| NaiveDate::from_ymd_opt(y, a, b))
+}
+
 fn source_id_from_url(listing_url: &str) -> Result<String> {
     let parsed = Url::parse(listing_url).context("invalid listing URL")?;
     Ok(parsed.host_str().unwrap_or("unknown").to_string())
@@ -256,7 +820,7 @@ fn external_id_for_url(job_url: &str) -> String {
 
 fn job_link_regex() -> Regex {
     Regex::new(
-        r"(?i)/(jobs?|careers?|positions?|vacancies|openings|employment|hiring)(/|$|\?|#)",
+        r"(?i)/(jobs?|careers?|positions?|vacancies|openings|employment|hiring|shpalljet)(/|$|\?|#)",
     )
     .expect("valid regex")
 }
@@ -269,7 +833,8 @@ fn looks_like_job_text(text: &str) -> bool {
         || t.contains("analyst")
         || t.contains("designer")
         || t.contains("intern")
-        || t.contains("hiring"))
+        || t.contains("hiring")
+        || t.contains("specialist"))
         && text.len() >= 8
         && text.len() <= 160
 }
@@ -308,6 +873,10 @@ fn parse_date_from_text(text: &str) -> Option<NaiveDate> {
         return today.checked_sub_signed(chrono::Duration::days(1));
     }
 
+    if let Some(d) = parse_slash_date(text) {
+        return Some(d);
+    }
+
     let days_ago = Regex::new(r"(\d+)\s+days?\s+ago").ok()?;
     if let Some(caps) = days_ago.captures(&lower) {
         let n: i64 = caps.get(1)?.as_str().parse().ok()?;
@@ -322,16 +891,8 @@ fn parse_date_from_text(text: &str) -> Option<NaiveDate> {
         return NaiveDate::from_ymd_opt(y, m, d);
     }
 
-    let slash = Regex::new(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b").ok()?;
-    if let Some(caps) = slash.captures(text) {
-        let a: u32 = caps.get(1)?.as_str().parse().ok()?;
-        let b: u32 = caps.get(2)?.as_str().parse().ok()?;
-        let y: i32 = caps.get(3)?.as_str().parse().ok()?;
-        return NaiveDate::from_ymd_opt(y, a, b).or_else(|| NaiveDate::from_ymd_opt(y, b, a));
-    }
-
     let months = [
-        ("jan", 1),
+        ("jan", 1u32),
         ("feb", 2),
         ("mar", 3),
         ("apr", 4),
@@ -345,8 +906,9 @@ fn parse_date_from_text(text: &str) -> Option<NaiveDate> {
         ("dec", 12),
     ];
     for (name, month) in months {
-        let re = Regex::new(&format!(r"(?i)\b{name}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s+(20\d{{2}}))?\b"))
-            .ok()?;
+        let re =
+            Regex::new(&format!(r"(?i)\b{name}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s+(20\d{{2}}))?\b"))
+                .ok()?;
         if let Some(caps) = re.captures(text) {
             let day: u32 = caps.get(1)?.as_str().parse().ok()?;
             let year: i32 = caps

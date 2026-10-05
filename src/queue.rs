@@ -126,11 +126,26 @@ impl QueueHandle {
         let job_id = job.id;
         let events = self.events.clone();
 
+        let pattern = if let Some(pid) = job.pattern_id {
+            self.db.get_pattern(pid).await?
+        } else {
+            self.db.find_pattern_for_url(&job.listing_url).await?
+        };
+
+        let pattern_cfg = pattern
+            .as_ref()
+            .and_then(|p| serde_json::from_value::<crate::models::PatternConfig>(p.config.clone()).ok());
+
+        if let Some(p) = &pattern {
+            info!(pattern = %p.name, "using scrape pattern");
+        }
+
         let stats = scraper::scrape_listing(
             self.browser.browser(),
             &job.listing_url,
             job.from_date,
             job.to_date,
+            pattern_cfg.as_ref(),
             token.clone(),
             |items, scraped_count, pages_visited| {
                 let db = db.clone();

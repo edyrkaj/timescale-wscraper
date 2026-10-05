@@ -24,9 +24,17 @@ export CHROME_PATH="$(which chromium || which google-chrome || which chromium-br
 cargo run
 ```
 
-## Schema
+## Scrape patterns (list → detail)
 
-See `schema.sql` for `scraped_items` (hypertable) and `scrape_jobs` (queue).
+Sites like [Tirana E-rekrutim](https://rekrutimi.tirana.al/shpalljet) list jobs on one page and put full data on `/shpalljet/{uuid}`.
+
+Patterns are stored in Timescale (`scrape_patterns`) and editable in the UI:
+
+1. Open **http://localhost:8080**
+2. Under **Scrape patterns**, create/edit a pattern (`url_match` + JSON config)
+3. Start a scrape with a matching listing URL — the pattern is auto-attached
+
+The Tirana pattern is seeded automatically. It uses the public list API, then opens each detail page for title/company/description enrichment.
 
 ## API
 
@@ -38,4 +46,6 @@ See `schema.sql` for `scraped_items` (hypertable) and `scrape_jobs` (queue).
 | POST | `/api/jobs/{id}/stop` | Stop job |
 | POST | `/api/jobs/{id}/restart` | Re-enqueue |
 | GET | `/api/jobs/stream` | SSE progress |
+| GET/POST | `/api/patterns` | List / create scrape patterns |
+| PUT/DELETE | `/api/patterns/{id}` | Update / delete pattern |
 | GET | `/api/items` | Recent scraped items |

@@ -35,16 +35,6 @@ impl JobStatus {
             Self::Failed => "failed",
         }
     }
-
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "running" => Self::Running,
-            "stopped" => Self::Stopped,
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            _ => Self::Queued,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -60,6 +50,7 @@ pub struct ScrapeJob {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub pattern_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +58,143 @@ pub struct CreateJobRequest {
     pub url: String,
     pub from_date: NaiveDate,
     pub to_date: NaiveDate,
+    pub pattern_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ScrapePattern {
+    pub id: Uuid,
+    pub name: String,
+    pub url_match: String,
+    pub config: serde_json::Value,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertPatternRequest {
+    pub name: String,
+    pub url_match: String,
+    pub config: PatternConfig,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternConfig {
+    pub list: ListConfig,
+    #[serde(default)]
+    pub detail: Option<DetailConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListConfig {
+    pub source: ListSource,
+    #[serde(default)]
+    pub api: Option<ApiListConfig>,
+    #[serde(default)]
+    pub dom: Option<DomListConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSource {
+    Api,
+    Dom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiListConfig {
+    pub url_template: String,
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    #[serde(default = "default_root_path")]
+    pub items_path: String,
+    pub id_path: String,
+    #[serde(default)]
+    pub published_at_path: Option<String>,
+    #[serde(default)]
+    pub title_path: Option<String>,
+    #[serde(default)]
+    pub company_path: Option<String>,
+    #[serde(default)]
+    pub company_literal: Option<String>,
+    #[serde(default)]
+    pub location_path: Option<String>,
+    #[serde(default)]
+    pub salary_path: Option<String>,
+    #[serde(default)]
+    pub description_path: Option<String>,
+    #[serde(default)]
+    pub detail_url_template: Option<String>,
+}
+
+fn default_page_size() -> u32 {
+    50
+}
+
+fn default_root_path() -> String {
+    "$".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomListConfig {
+    #[serde(default)]
+    pub wait_for: Option<String>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    /// CSS selector for anchors that point to detail pages
+    #[serde(default)]
+    pub item_link_selector: Option<String>,
+    /// Regex applied to hrefs if selector not enough
+    #[serde(default)]
+    pub item_link_regex: Option<String>,
+    #[serde(default)]
+    pub next_page_selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetailConfig {
+    pub source: DetailSource,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub fields: DetailFields,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailSource {
+    Page,
+    None,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DetailFields {
+    #[serde(default)]
+    pub title_selector: Option<String>,
+    #[serde(default)]
+    pub title_label: Option<String>,
+    #[serde(default)]
+    pub company_selector: Option<String>,
+    #[serde(default)]
+    pub company_label: Option<String>,
+    #[serde(default)]
+    pub location_selector: Option<String>,
+    #[serde(default)]
+    pub location_label: Option<String>,
+    #[serde(default)]
+    pub salary_selector: Option<String>,
+    #[serde(default)]
+    pub salary_label: Option<String>,
+    #[serde(default)]
+    pub description_selector: Option<String>,
+    #[serde(default)]
+    pub date_selector: Option<String>,
+    #[serde(default)]
+    pub date_label: Option<String>,
+    #[serde(default)]
+    pub date_regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

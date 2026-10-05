@@ -9,7 +9,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::models::{CreateJobRequest, ProgressEvent};
+use crate::models::{CreateJobRequest, ProgressEvent, UpsertPatternRequest};
 use crate::AppState;
 
 pub async fn create_job(
@@ -33,7 +33,7 @@ pub async fn create_job(
 
     match state
         .db
-        .create_job(&body.url, body.from_date, body.to_date)
+        .create_job(&body.url, body.from_date, body.to_date, body.pattern_id)
         .await
     {
         Ok(job) => {
@@ -90,7 +90,12 @@ pub async fn restart_job(
     match state.db.get_job(id).await {
         Ok(Some(job)) => match state
             .db
-            .create_job(&job.listing_url, job.from_date, job.to_date)
+            .create_job(
+                &job.listing_url,
+                job.from_date,
+                job.to_date,
+                job.pattern_id,
+            )
             .await
         {
             Ok(new_job) => {
@@ -119,6 +124,77 @@ pub async fn restart_job(
 pub async fn list_items(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.list_items(100).await {
         Ok(items) => Json(items).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_patterns(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.list_patterns().await {
+        Ok(patterns) => Json(patterns).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn create_pattern(
+    State(state): State<AppState>,
+    Json(body): Json<UpsertPatternRequest>,
+) -> impl IntoResponse {
+    if body.name.trim().is_empty() || body.url_match.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name and url_match are required"})),
+        )
+            .into_response();
+    }
+    match state.db.create_pattern(&body).await {
+        Ok(pattern) => (axum::http::StatusCode::CREATED, Json(pattern)).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn update_pattern(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpsertPatternRequest>,
+) -> impl IntoResponse {
+    match state.db.update_pattern(id, &body).await {
+        Ok(Some(pattern)) => Json(pattern).into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pattern not found"})),
+        )
+            .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_pattern(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.db.delete_pattern(id).await {
+        Ok(true) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "pattern not found"})),
+        )
+            .into_response(),
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),

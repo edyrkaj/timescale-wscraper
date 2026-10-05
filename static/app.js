@@ -7,9 +7,45 @@ const message = document.getElementById("message");
 const progressBar = document.getElementById("progress-bar");
 const jobsEl = document.getElementById("jobs");
 const itemsEl = document.getElementById("items");
+const patternsEl = document.getElementById("patterns");
+const patternSelect = document.getElementById("pattern_id");
+const patternForm = document.getElementById("pattern-form");
+const patternConfig = document.getElementById("pattern_config");
 
 let selectedJobId = null;
 let currentRunningId = null;
+let editingPatternId = null;
+let patternsCache = [];
+
+const DEFAULT_PATTERN = {
+  list: {
+    source: "api",
+    api: {
+      url_template: "https://rekrutimi.tirana.al/api/api/Job/public-announcements?PageNumber={page}&PageSize={page_size}",
+      page_size: 50,
+      items_path: "$",
+      id_path: "id",
+      published_at_path: "job.0.publishedDate",
+      title_path: "job.0.jobPositionsResponse.0.positionName",
+      company_literal: "Bashkia Tiranë",
+      location_path: "job.0.jobPositionsResponse.0.organisationalUnit",
+      salary_path: "job.0.jobPositionsResponse.0.categoryName",
+      detail_url_template: "https://rekrutimi.tirana.al/shpalljet/{id}"
+    }
+  },
+  detail: {
+    source: "page",
+    wait_ms: 2500,
+    fields: {
+      title_label: "Pozicioni",
+      company_label: "Institucioni",
+      description_selector: "div.card.p-3",
+      date_regex: "\\b(\\d{1,2}/\\d{1,2}/20\\d{2})\\b"
+    }
+  }
+};
+
+patternConfig.value = JSON.stringify(DEFAULT_PATTERN, null, 2);
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
@@ -26,10 +62,12 @@ document.getElementById("from_date").value = daysAgoIso(30);
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
+  const patternId = patternSelect.value || null;
   const body = {
     url: document.getElementById("url").value.trim(),
     from_date: document.getElementById("from_date").value,
     to_date: document.getElementById("to_date").value,
+    pattern_id: patternId,
   };
   const res = await fetch("/api/jobs", {
     method: "POST",
@@ -42,7 +80,7 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   selectedJobId = data.id;
-  message.textContent = `Enqueued ${data.id}`;
+  message.textContent = `Enqueued ${data.id}${data.pattern_id ? " (pattern attached)" : ""}`;
   restartBtn.disabled = false;
   await refreshJobs();
 });
@@ -69,6 +107,50 @@ restartBtn.addEventListener("click", async () => {
   await refreshJobs();
 });
 
+patternForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  let config;
+  try {
+    config = JSON.parse(patternConfig.value);
+  } catch (err) {
+    message.textContent = `Invalid JSON: ${err.message}`;
+    return;
+  }
+  const body = {
+    name: document.getElementById("pattern_name").value.trim(),
+    url_match: document.getElementById("pattern_match").value.trim(),
+    config,
+    enabled: true,
+  };
+  const url = editingPatternId ? `/api/patterns/${editingPatternId}` : "/api/patterns";
+  const method = editingPatternId ? "PUT" : "POST";
+  const res = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    message.textContent = data.error || "Failed to save pattern";
+    return;
+  }
+  message.textContent = editingPatternId ? "Pattern updated" : "Pattern created";
+  editingPatternId = null;
+  resetPatternForm();
+  await refreshPatterns();
+});
+
+document.getElementById("pattern-reset").addEventListener("click", () => {
+  editingPatternId = null;
+  resetPatternForm();
+});
+
+function resetPatternForm() {
+  document.getElementById("pattern_name").value = "";
+  document.getElementById("pattern_match").value = "";
+  patternConfig.value = JSON.stringify(DEFAULT_PATTERN, null, 2);
+}
+
 function applyProgress(evt) {
   const scraped = evt.scraped_count || (evt.current_job && evt.current_job.scraped_count) || 0;
   const queueDepth = evt.queue_depth || 0;
@@ -85,7 +167,6 @@ function applyProgress(evt) {
   stopBtn.disabled = !running && !currentRunningId;
   progressBar.classList.toggle("active", running);
 
-  // Soft progress toward max items (2000)
   const pct = Math.min(92, Math.max(8, (scraped / 2000) * 100 + (running ? 8 : 0)));
   progressBar.style.width = `${pct}%`;
   if (!running && status === "completed") progressBar.style.width = "100%";
@@ -101,8 +182,9 @@ async function refreshJobs() {
   for (const job of jobs) {
     const li = document.createElement("li");
     if (job.id === selectedJobId) li.classList.add("selected");
-    li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${job.pages_visited} pages</div>
-      <div class="meta">${job.listing_url}</div>
+    const patternName = patternsCache.find((p) => p.id === job.pattern_id)?.name || (job.pattern_id ? job.pattern_id.slice(0, 8) : "heuristic");
+    li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${job.pages_visited} pages · ${escapeHtml(patternName)}</div>
+      <div class="meta">${escapeHtml(job.listing_url)}</div>
       <div class="meta">${job.from_date} → ${job.to_date} · ${job.id}</div>`;
     li.addEventListener("click", () => {
       selectedJobId = job.id;
@@ -123,6 +205,49 @@ async function refreshItems() {
       <div class="meta">${escapeHtml(item.company || "—")} · ${escapeHtml(item.location || "—")} · ${item.item_timestamp}</div>`;
     itemsEl.appendChild(li);
   }
+}
+
+async function refreshPatterns() {
+  const res = await fetch("/api/patterns");
+  patternsCache = await res.json();
+  const previous = patternSelect.value;
+  patternSelect.innerHTML = `<option value="">Auto / heuristic</option>`;
+  patternsEl.innerHTML = "";
+  for (const p of patternsCache) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = `${p.name} (${p.url_match})`;
+    patternSelect.appendChild(opt);
+
+    const li = document.createElement("li");
+    li.innerHTML = `<div><strong>${escapeHtml(p.name)}</strong> ${p.enabled ? "" : "(disabled)"}</div>
+      <div class="meta">match: ${escapeHtml(p.url_match)}</div>
+      <div class="pattern-actions">
+        <button type="button" data-edit="${p.id}">Edit</button>
+        <button type="button" class="secondary" data-del="${p.id}">Delete</button>
+      </div>`;
+    patternsEl.appendChild(li);
+  }
+  if (previous) patternSelect.value = previous;
+
+  patternsEl.querySelectorAll("[data-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const p = patternsCache.find((x) => x.id === btn.dataset.edit);
+      if (!p) return;
+      editingPatternId = p.id;
+      document.getElementById("pattern_name").value = p.name;
+      document.getElementById("pattern_match").value = p.url_match;
+      patternConfig.value = JSON.stringify(p.config, null, 2);
+      message.textContent = `Editing pattern ${p.name}`;
+    });
+  });
+  patternsEl.querySelectorAll("[data-del]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Delete this pattern?")) return;
+      await fetch(`/api/patterns/${btn.dataset.del}`, { method: "DELETE" });
+      await refreshPatterns();
+    });
+  });
 }
 
 function escapeHtml(s) {
@@ -149,8 +274,10 @@ function connectSse() {
 }
 
 connectSse();
-refreshJobs();
-refreshItems();
+refreshPatterns().then(() => {
+  refreshJobs();
+  refreshItems();
+});
 setInterval(() => {
   refreshJobs();
   refreshItems();

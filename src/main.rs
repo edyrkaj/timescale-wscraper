@@ -4,7 +4,7 @@ mod models;
 mod queue;
 mod scraper;
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use db::Db;
 use queue::QueueHandle;
@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
     let db = Db::new(pool);
+    db.ensure_schema().await?;
 
     info!("launching Chromium");
     let browser = Arc::new(BrowserPool::launch().await?);
@@ -67,6 +68,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/jobs/{id}/stop", post(api::stop_job))
         .route("/api/jobs/{id}/restart", post(api::restart_job))
         .route("/api/items", get(api::list_items))
+        .route(
+            "/api/patterns",
+            get(api::list_patterns).post(api::create_pattern),
+        )
+        .route(
+            "/api/patterns/{id}",
+            put(api::update_pattern).delete(api::delete_pattern),
+        )
         .fallback_service(
             ServeDir::new(&static_dir).not_found_service(ServeFile::new(index)),
         )
