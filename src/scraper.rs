@@ -114,6 +114,7 @@ pub async fn scrape_listing<F, Fut>(
     from_date: NaiveDate,
     to_date: NaiveDate,
     pattern: Option<&PatternConfig>,
+    use_ai: bool,
     cancel: CancellationToken,
     on_batch: F,
 ) -> Result<ScrapeStats>
@@ -121,6 +122,11 @@ where
     F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    if use_ai {
+        info!("using AI scrape (LLM extraction)");
+        return scrape_with_ai(listing_url, from_date, to_date, cancel, on_batch).await;
+    }
+
     let inferred;
     let cfg = match pattern {
         Some(c) => Some(c),
@@ -138,6 +144,139 @@ where
 
     let browser = browser.context("no scrape pattern matched and Chromium is unavailable")?;
     scrape_heuristic(browser, listing_url, from_date, to_date, cancel, on_batch).await
+}
+
+async fn scrape_with_ai<F, Fut>(
+    listing_url: &str,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    cancel: CancellationToken,
+    mut on_batch: F,
+) -> Result<ScrapeStats>
+where
+    F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let cfg = crate::ai::LlmConfig::from_env()?;
+    let source_id = source_id_from_url(listing_url)?;
+    let origin = Url::parse(listing_url).context("invalid listing URL")?;
+
+    let mut stats = ScrapeStats::default();
+    let mut current = listing_url.to_string();
+    let mut visited = std::collections::HashSet::new();
+    let mut seen_jobs = std::collections::HashSet::new();
+
+    while stats.pages_visited < MAX_PAGES && stats.scraped_count < MAX_ITEMS {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if !visited.insert(current.clone()) {
+            break;
+        }
+
+        stats.pages_visited += 1;
+        info!(url = %current, page = stats.pages_visited, "AI scrape: fetching page");
+        let page = fetch_page_via_playwright(&current, &cancel).await?;
+        let extract =
+            crate::ai::extract_jobs_from_page(&cfg, listing_url, from_date, to_date, &page)
+                .await?;
+        let next_raw = extract.next_page_url.clone();
+        let (kept, saw_older) = crate::ai::filter_extract(extract, from_date, to_date);
+
+        let mut batch = Vec::new();
+        for (item, published) in kept {
+            if !seen_jobs.insert(item.url.clone()) {
+                continue;
+            }
+            batch.push(ScrapedItem {
+                source_id: source_id.clone(),
+                external_id: external_id_for_url(&item.url),
+                item_timestamp: published.map(date_to_utc).unwrap_or_else(Utc::now),
+                title: item.title,
+                url: item.url,
+                company: item.company,
+                location: item.location,
+                salary: item.salary,
+                description: item.description,
+            });
+            if stats.scraped_count + batch.len() as i32 >= MAX_ITEMS {
+                break;
+            }
+        }
+
+        let this_page_empty = batch.is_empty();
+        stats.scraped_count += batch.len() as i32;
+        on_batch(batch, stats.scraped_count, stats.pages_visited).await?;
+
+        if this_page_empty && saw_older {
+            break;
+        }
+
+        let Some(next) = resolve_same_origin_next(&origin, &page.final_url, next_raw.as_deref())
+        else {
+            break;
+        };
+        if visited.contains(&next) {
+            break;
+        }
+        current = next;
+    }
+
+    Ok(stats)
+}
+
+fn resolve_same_origin_next(
+    listing: &Url,
+    final_url: &str,
+    next: Option<&str>,
+) -> Option<String> {
+    let next = next.map(str::trim).filter(|s| !s.is_empty())?;
+    let base = Url::parse(final_url).ok().unwrap_or_else(|| listing.clone());
+    let resolved = base.join(next).ok().or_else(|| Url::parse(next).ok())?;
+    if resolved.host_str()? != listing.host_str()? {
+        return None;
+    }
+    Some(resolved.to_string())
+}
+
+async fn fetch_page_via_playwright(
+    url: &str,
+    cancel: &CancellationToken,
+) -> Result<crate::ai::FetchedPage> {
+    let base = std::env::var("PLAYWRIGHT_URL")
+        .unwrap_or_else(|_| "http://playwright:3001".into())
+        .trim_end_matches('/')
+        .to_string();
+    let endpoint = format!("{base}/fetch-page");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+    let payload = serde_json::json!({
+        "url": url,
+        "wait_ms": 2000,
+        "timeout_ms": 90_000,
+    });
+    let send = client.post(&endpoint).json(&payload).send();
+    let res = tokio::select! {
+        _ = cancel.cancelled() => anyhow::bail!("AI page fetch cancelled"),
+        r = send => r.with_context(|| format!("Playwright worker unreachable at {endpoint}"))?,
+    };
+    let status = res.status();
+    let page: crate::ai::FetchedPage = res
+        .json()
+        .await
+        .context("invalid Playwright /fetch-page JSON")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "{}",
+            page.error
+                .unwrap_or_else(|| format!("Playwright fetch-page failed ({status})"))
+        );
+    }
+    if let Some(err) = page.error.as_deref().filter(|s| !s.is_empty()) {
+        anyhow::bail!("{err}");
+    }
+    Ok(page)
 }
 
 /// Build an API list pattern for Albanian e-rekrutim style `/shpalljet` portals.

@@ -42,6 +42,15 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            ALTER TABLE scrape_jobs
+            ADD COLUMN IF NOT EXISTS use_ai BOOLEAN NOT NULL DEFAULT FALSE
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Seed / refresh known e-rekrutim patterns (API list — no Chromium required)
         let tirana_config = serde_json::json!({
             "list": {
@@ -173,20 +182,25 @@ impl Db {
         from_date: NaiveDate,
         to_date: NaiveDate,
         pattern_id: Option<Uuid>,
+        use_ai: bool,
     ) -> Result<ScrapeJob> {
         let id = Uuid::new_v4();
-        let resolved_pattern = match pattern_id {
-            Some(pid) => Some(pid),
-            None => self
-                .find_pattern_for_url(listing_url)
-                .await?
-                .map(|p| p.id),
+        let resolved_pattern = if use_ai {
+            None
+        } else {
+            match pattern_id {
+                Some(pid) => Some(pid),
+                None => self
+                    .find_pattern_for_url(listing_url)
+                    .await?
+                    .map(|p| p.id),
+            }
         };
 
         let job = sqlx::query_as::<_, ScrapeJob>(
             r#"
-            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id)
-            VALUES ($1, $2, $3, $4, 'queued', $5)
+            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id, use_ai)
+            VALUES ($1, $2, $3, $4, 'queued', $5, $6)
             RETURNING *
             "#,
         )
@@ -195,6 +209,7 @@ impl Db {
         .bind(from_date)
         .bind(to_date)
         .bind(resolved_pattern)
+        .bind(use_ai)
         .fetch_one(&self.pool)
         .await?;
         Ok(job)

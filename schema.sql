@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS scrape_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
-    pattern_id UUID
+    pattern_id UUID,
+    use_ai BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS scrape_jobs_status_created_idx

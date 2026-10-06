@@ -11,6 +11,15 @@ const patternsEl = document.getElementById("patterns");
 const patternSelect = document.getElementById("pattern_id");
 const patternForm = document.getElementById("pattern-form");
 const patternConfig = document.getElementById("pattern_config");
+const useAi = document.getElementById("use_ai");
+
+function syncAiToggle() {
+  const on = useAi.checked;
+  patternSelect.disabled = on;
+  if (on) patternSelect.value = "";
+}
+
+useAi.addEventListener("change", syncAiToggle);
 
 let selectedJobId = null;
 let currentRunningId = null;
@@ -248,12 +257,13 @@ initDatePicker(document.getElementById("to_date"));
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const patternId = patternSelect.value || null;
+  const patternId = useAi.checked ? null : (patternSelect.value || null);
   const body = {
     url: document.getElementById("url").value.trim(),
     from_date: document.getElementById("from_date").value,
     to_date: document.getElementById("to_date").value,
     pattern_id: patternId,
+    use_ai: useAi.checked,
   };
   const res = await fetch("/api/jobs", {
     method: "POST",
@@ -266,7 +276,9 @@ form.addEventListener("submit", async (e) => {
     return;
   }
   selectedJobId = data.id;
-  message.textContent = `Enqueued ${data.id}${data.pattern_id ? " (pattern attached)" : ""}`;
+  message.textContent = `Enqueued ${data.id}${
+    data.use_ai ? " (AI scrape)" : data.pattern_id ? " (pattern attached)" : ""
+  }`;
   restartBtn.disabled = false;
   await refreshJobs();
 });
@@ -368,7 +380,9 @@ async function refreshJobs() {
   for (const job of jobs) {
     const li = document.createElement("li");
     if (job.id === selectedJobId) li.classList.add("selected");
-    const patternName = patternsCache.find((p) => p.id === job.pattern_id)?.name || (job.pattern_id ? job.pattern_id.slice(0, 8) : "heuristic");
+    const patternName = job.use_ai
+      ? "AI scraper"
+      : patternsCache.find((p) => p.id === job.pattern_id)?.name || (job.pattern_id ? job.pattern_id.slice(0, 8) : "heuristic");
     li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${job.pages_visited} pages · ${escapeHtml(patternName)}</div>
       <div class="meta">${escapeHtml(job.listing_url)}</div>
       <div class="meta">${job.from_date} → ${job.to_date} · ${job.id}</div>`;

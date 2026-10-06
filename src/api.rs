@@ -33,7 +33,13 @@ pub async fn create_job(
 
     match state
         .db
-        .create_job(&body.url, body.from_date, body.to_date, body.pattern_id)
+        .create_job(
+            &body.url,
+            body.from_date,
+            body.to_date,
+            body.pattern_id,
+            body.use_ai,
+        )
         .await
     {
         Ok(job) => {
@@ -43,7 +49,11 @@ pub async fn create_job(
                 queue_depth: state.db.queue_depth().await.unwrap_or(0),
                 scraped_count: 0,
                 status: "queued".into(),
-                message: format!("Enqueued job {}", job.id),
+                message: format!(
+                    "Enqueued job {}{}",
+                    job.id,
+                    if job.use_ai { " (AI scrape)" } else { "" }
+                ),
             });
             (axum::http::StatusCode::CREATED, Json(job)).into_response()
         }
@@ -95,6 +105,7 @@ pub async fn restart_job(
                 job.from_date,
                 job.to_date,
                 job.pattern_id,
+                job.use_ai,
             )
             .await
         {

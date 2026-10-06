@@ -1,3 +1,4 @@
+mod ai;
 mod api;
 mod db;
 mod models;

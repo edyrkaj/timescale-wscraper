@@ -74,7 +74,15 @@ impl QueueHandle {
         info!(job_id = %job.id, url = %job.listing_url, "starting scrape job");
         let token = CancellationToken::new();
         *self.cancel.lock().await = Some((job.id, token.clone()));
-        self.emit_job(&job, "Scraping started").await;
+        self.emit_job(
+            &job,
+            if job.use_ai {
+                "AI scrape…"
+            } else {
+                "Scraping started"
+            },
+        )
+        .await;
 
         let result = self.run_job(&job, token.clone()).await;
 
@@ -128,7 +136,9 @@ impl QueueHandle {
         let job_id = job.id;
         let events = self.events.clone();
 
-        let pattern = if let Some(pid) = job.pattern_id {
+        let pattern = if job.use_ai {
+            None
+        } else if let Some(pid) = job.pattern_id {
             self.db.get_pattern(pid).await?
         } else {
             self.db.find_pattern_for_url(&job.listing_url).await?
@@ -138,13 +148,16 @@ impl QueueHandle {
             serde_json::from_value::<crate::models::PatternConfig>(p.config.clone()).ok()
         });
 
-        if let Some(p) = &pattern {
+        if job.use_ai {
+            info!("AI scrape enabled; skipping patterns");
+        } else if let Some(p) = &pattern {
             info!(pattern = %p.name, "using scrape pattern");
         } else {
             info!("no DB pattern; will try built-in e-rekrutim inference");
         }
 
         let browser = self.browser.as_ref().map(|b| b.browser());
+        let ai_progress = job.use_ai;
 
         let stats = scraper::scrape_listing(
             browser,
@@ -152,6 +165,7 @@ impl QueueHandle {
             job.from_date,
             job.to_date,
             pattern_cfg.as_ref(),
+            job.use_ai,
             token.clone(),
             |items, scraped_count, pages_visited| {
                 let db = db.clone();
@@ -167,7 +181,11 @@ impl QueueHandle {
                         queue_depth,
                         scraped_count,
                         status: "running".into(),
-                        message: format!("Saved batch; total {scraped_count}"),
+                        message: if ai_progress {
+                            format!("AI scrape… saved batch; total {scraped_count}")
+                        } else {
+                            format!("Saved batch; total {scraped_count}")
+                        },
                     });
                     Ok(())
                 }

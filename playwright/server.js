@@ -166,6 +166,66 @@ async function scrapeList(body) {
   }
 }
 
+async function fetchPage(body) {
+  const url = body.url;
+  if (!url) throw Object.assign(new Error("url is required"), { status: 400 });
+
+  const timeoutMs = Number(body.timeout_ms) || 90_000;
+  const waitMs = Number(body.wait_ms) || 2000;
+
+  const b = await getBrowser();
+  const context = await b.newContext({
+    userAgent: UA,
+    locale: "sq-AL",
+    viewport: { width: 1365, height: 900 },
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await new Promise((r) => setTimeout(r, waitMs));
+    const { ready, diag } = await waitForListing(page, "body", timeoutMs);
+    if (!ready || looksLikeCloudflare(diag)) {
+      const err = new Error(
+        `Cloudflare challenge blocked page fetch for ${url}. Diagnostics: ${JSON.stringify(diag)}`
+      );
+      err.status = 503;
+      throw err;
+    }
+
+    return page.evaluate(() => {
+      const text = (document.body && document.body.innerText ? document.body.innerText : "").slice(
+        0,
+        80_000
+      );
+      const seen = new Set();
+      const links = [];
+      for (const a of document.querySelectorAll("a[href]")) {
+        const href = a.href;
+        if (!href || seen.has(href)) continue;
+        if (href.startsWith("javascript:") || href.startsWith("mailto:")) continue;
+        seen.add(href);
+        links.push({
+          text: ((a.innerText || a.textContent || "").trim()).slice(0, 160),
+          href,
+        });
+        if (links.length >= 400) break;
+      }
+      return {
+        final_url: location.href || "",
+        title: document.title || "",
+        text,
+        links,
+      };
+    });
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -197,6 +257,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/scrape-list") {
       const payload = await readJson(req);
       const result = await scrapeList(payload);
+      return send(200, result);
+    }
+    if (req.method === "POST" && req.url === "/fetch-page") {
+      const payload = await readJson(req);
+      const result = await fetchPage(payload);
       return send(200, result);
     }
     send(404, { error: "not found" });

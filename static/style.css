@@ -88,6 +88,25 @@ input {
   gap: 0.6rem;
 }
 
+.ai-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.ai-toggle input[type="checkbox"] {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+select:disabled {
+  opacity: 0.45;
+}
+
 button {
   border: 0;
   border-radius: 999px;

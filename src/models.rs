@@ -51,6 +51,8 @@ pub struct ScrapeJob {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub pattern_id: Option<Uuid>,
+    #[serde(default)]
+    pub use_ai: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +61,8 @@ pub struct CreateJobRequest {
     pub from_date: NaiveDate,
     pub to_date: NaiveDate,
     pub pattern_id: Option<Uuid>,
+    #[serde(default)]
+    pub use_ai: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
