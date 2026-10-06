@@ -32,6 +32,10 @@ impl BrowserPool {
     pub async fn launch() -> Result<Self> {
         let chrome = std::env::var("CHROME_PATH").unwrap_or_else(|_| {
             [
+                // Prefer the real binary; Debian/Ubuntu /usr/bin/chromium is a shell wrapper
+                // that breaks chromiumoxide's CDP port discovery.
+                "/usr/lib/chromium/chromium",
+                "/usr/lib/chromium-browser/chromium-browser",
                 "/usr/bin/chromium",
                 "/usr/bin/chromium-browser",
                 "/usr/bin/google-chrome",
@@ -43,19 +47,39 @@ impl BrowserPool {
             .to_string()
         });
 
-        let config = BrowserConfig::builder()
-            .chrome_executable(chrome)
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-gpu")
-            .arg("--headless=new")
-            .viewport(None)
+        info!(%chrome, "launching Chromium for CDP");
+
+        // Cloudflare managed challenges detect `--headless`; prefer headed under Xvfb in Docker.
+        let headless = std::env::var("HEADLESS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+
+        let mut builder = BrowserConfig::builder()
+            .chrome_executable(&chrome)
+            .no_sandbox()
+            .hide()
+            .arg("disable-dev-shm-usage")
+            .arg("disable-gpu")
+            .arg(("disable-blink-features", "AutomationControlled"))
+            .arg(("window-size", "1365,900"))
+            .arg(("lang", "sq-AL,sq,en-US,en"))
+            .arg("no-first-run")
+            .arg("no-default-browser-check")
+            .viewport(None);
+
+        builder = if headless {
+            builder.new_headless_mode()
+        } else {
+            builder.with_head()
+        };
+
+        let config = builder
             .build()
             .map_err(|e| anyhow!("browser config: {e}"))?;
 
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .context("failed to launch Chromium")?;
+        let (browser, mut handler) = Browser::launch(config).await.with_context(|| {
+            format!("failed to launch Chromium at {chrome}")
+        })?;
 
         tokio::spawn(async move {
             while let Some(_event) = handler.next().await {}
@@ -69,6 +93,19 @@ impl BrowserPool {
     pub fn browser(&self) -> Arc<Browser> {
         self.browser.clone()
     }
+}
+
+async fn prepare_page(browser: &Browser) -> Result<Page> {
+    let page = browser.new_page("about:blank").await?;
+    // Match a recent desktop Chrome UA (Linux Docker) for CF fingerprints.
+    let ua = std::env::var("CHROME_UA").unwrap_or_else(|_| {
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            .into()
+    });
+    if let Err(err) = page.enable_stealth_mode_with_agent(&ua).await {
+        warn!(error = %err, "stealth mode setup failed; continuing");
+    }
+    Ok(page)
 }
 
 pub async fn scrape_listing<F, Fut>(
@@ -176,13 +213,12 @@ where
             collect_from_api(api, &source_id, from_date, to_date, &cancel, &mut stats).await?
         }
         ListSource::Dom => {
-            let browser = browser.clone().context("DOM scrape requires Chromium")?;
             let dom = pattern
                 .list
                 .dom
                 .as_ref()
                 .context("pattern list.source=dom but dom config missing")?;
-            collect_from_dom(browser, listing_url, dom, &source_id, &cancel, &mut stats).await?
+            collect_from_dom(listing_url, dom, &source_id, &cancel, &mut stats).await?
         }
     };
 
@@ -192,7 +228,7 @@ where
         match detail.source {
             DetailSource::Page => {
                 let browser = browser.context("detail.source=page requires Chromium")?;
-                let page = browser.new_page("about:blank").await?;
+                let page = prepare_page(&browser).await?;
                 let mut enriched = Vec::new();
                 for mut item in candidates {
                     if cancel.is_cancelled() || stats.scraped_count >= MAX_ITEMS {
@@ -472,199 +508,117 @@ async fn collect_from_api(
 }
 
 async fn collect_from_dom(
-    browser: Arc<Browser>,
     listing_url: &str,
     dom: &DomListConfig,
     source_id: &str,
     cancel: &CancellationToken,
     stats: &mut ScrapeStats,
 ) -> Result<Vec<ScrapedItem>> {
-    let page = browser.new_page("about:blank").await?;
-    let mut current = listing_url.to_string();
-    let mut seen = std::collections::HashSet::new();
+    let base = std::env::var("PLAYWRIGHT_URL")
+        .unwrap_or_else(|_| "http://playwright:3001".into())
+        .trim_end_matches('/')
+        .to_string();
+    let endpoint = format!("{base}/scrape-list");
+    info!(%endpoint, %listing_url, "DOM scrape via Playwright worker");
+
+    let payload = serde_json::json!({
+        "url": listing_url,
+        "wait_for": dom.wait_for,
+        "wait_ms": dom.wait_ms.unwrap_or(2000),
+        "card_selector": dom.card_selector,
+        "title_selector": dom.title_selector,
+        "company_selector": dom.company_selector,
+        "location_selector": dom.location_selector,
+        "date_selector": dom.date_selector,
+        "item_link_selector": dom.item_link_selector,
+        "item_link_regex": dom.item_link_regex,
+        "next_page_selector": dom.next_page_selector,
+        "max_pages": MAX_PAGES,
+        "max_items": MAX_ITEMS,
+        "timeout_ms": 90_000,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+
+    let send = client.post(&endpoint).json(&payload).send();
+    let res = tokio::select! {
+        _ = cancel.cancelled() => anyhow::bail!("DOM scrape cancelled"),
+        r = send => r.with_context(|| format!("Playwright worker unreachable at {endpoint}"))?,
+    };
+
+    let status = res.status();
+    let body: PlaywrightListResponse = res
+        .json()
+        .await
+        .context("invalid Playwright worker JSON")?;
+    stats.pages_visited = body.pages_visited.max(stats.pages_visited);
+    if !status.is_success() {
+        anyhow::bail!(
+            "{}",
+            body.error
+                .unwrap_or_else(|| format!("Playwright scrape failed ({status})"))
+        );
+    }
+    if let Some(err) = body.error.filter(|s| !s.is_empty()) {
+        anyhow::bail!("{err}");
+    }
+
     let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let link_re = dom
         .item_link_regex
         .as_ref()
         .and_then(|r| Regex::new(r).ok());
-    let use_cards = dom.card_selector.as_ref().is_some_and(|s| !s.is_empty());
 
-    while stats.pages_visited < MAX_PAGES && items.len() < MAX_ITEMS as usize {
-        if cancel.is_cancelled() {
-            break;
-        }
-        stats.pages_visited += 1;
-        page.goto(&current).await?;
-        page.wait_for_navigation().await.ok();
-        let wait_ms = dom.wait_ms.unwrap_or(2000);
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-        if let Some(sel) = &dom.wait_for {
-            for _ in 0..20 {
-                let present: bool = page
-                    .evaluate(format!(
-                        "!!document.querySelector({})",
-                        serde_json::to_string(sel).unwrap()
-                    ))
-                    .await
-                    .ok()
-                    .and_then(|r| r.into_value().ok())
-                    .unwrap_or(false);
-                if present {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        }
-
-        if use_cards {
-            let cfg = serde_json::json!({
-                "card": dom.card_selector,
-                "title": dom.title_selector,
-                "company": dom.company_selector,
-                "location": dom.location_selector,
-                "date": dom.date_selector,
-            });
-            let cards: Vec<DomCardExtract> = page
-                .evaluate(format!(
-                    r#"
-                    (() => {{
-                      const cfg = {cfg};
-                      const text = (el) => (el && (el.innerText || el.textContent) || '').trim();
-                      return [...document.querySelectorAll(cfg.card)].map((card) => {{
-                        const titleEl = cfg.title ? card.querySelector(cfg.title) : null;
-                        const companyEl = cfg.company ? card.querySelector(cfg.company) : null;
-                        const locationEl = cfg.location ? card.querySelector(cfg.location) : null;
-                        const dateEl = cfg.date ? card.querySelector(cfg.date) : null;
-                        return {{
-                          url: titleEl && titleEl.href ? titleEl.href : null,
-                          title: text(titleEl) || null,
-                          company: text(companyEl) || null,
-                          location: text(locationEl) || null,
-                          dateText: text(dateEl) || null
-                        }};
-                      }}).filter((row) => row.url);
-                    }})()
-                    "#,
-                    cfg = cfg
-                ))
-                .await?
-                .into_value()
-                .unwrap_or_default();
-
-            for card in cards {
-                let href = match card.url {
-                    Some(u) if !u.is_empty() => u,
-                    _ => continue,
-                };
-                if let Some(re) = &link_re {
-                    if !re.is_match(&href) {
-                        continue;
-                    }
-                }
-                if !seen.insert(href.clone()) {
-                    continue;
-                }
-                let ts = card
-                    .date_text
-                    .as_deref()
-                    .and_then(parse_date_from_text)
-                    .map(date_to_utc)
-                    .unwrap_or_else(Utc::now);
-                let title = card
-                    .title
-                    .filter(|t| t.len() >= 2)
-                    .unwrap_or_else(|| "Untitled job".into());
-                items.push(ScrapedItem {
-                    source_id: source_id.to_string(),
-                    external_id: external_id_for_url(&href),
-                    item_timestamp: ts,
-                    title: title.chars().take(300).collect(),
-                    url: href,
-                    company: card.company.filter(|s| !s.is_empty()),
-                    location: card.location.filter(|s| !s.is_empty()),
-                    salary: None,
-                    description: None,
-                });
-            }
-        } else {
-            let selector = dom
-                .item_link_selector
-                .clone()
-                .unwrap_or_else(|| "a[href]".into());
-
-            let hrefs: Vec<String> = page
-                .evaluate(format!(
-                    r#"
-                    (() => {{
-                      const sel = {sel};
-                      return [...document.querySelectorAll(sel)]
-                        .map(a => a.href)
-                        .filter(Boolean);
-                    }})()
-                    "#,
-                    sel = serde_json::to_string(&selector).unwrap()
-                ))
-                .await?
-                .into_value()
-                .unwrap_or_default();
-
-            for href in hrefs {
-                if let Some(re) = &link_re {
-                    if !re.is_match(&href) {
-                        continue;
-                    }
-                }
-                if !seen.insert(href.clone()) {
-                    continue;
-                }
-                items.push(ScrapedItem {
-                    source_id: source_id.to_string(),
-                    external_id: external_id_for_url(&href),
-                    item_timestamp: Utc::now(),
-                    title: "Untitled job".into(),
-                    url: href,
-                    company: None,
-                    location: None,
-                    salary: None,
-                    description: None,
-                });
-            }
-        }
-
-        let next_sel = match &dom.next_page_selector {
-            Some(s) => s.clone(),
-            None => break,
+    for card in body.cards {
+        let href = match card.url {
+            Some(u) if !u.is_empty() => u,
+            _ => continue,
         };
-        let next_href: Option<String> = page
-            .evaluate(format!(
-                r#"
-                (() => {{
-                  const el = document.querySelector({sel});
-                  if (!el) return null;
-                  if (el.disabled || el.getAttribute('aria-disabled') === 'true') return null;
-                  if (el.href) return el.href;
-                  el.click();
-                  return 'clicked';
-                }})()
-                "#,
-                sel = serde_json::to_string(&next_sel).unwrap()
-            ))
-            .await?
-            .into_value()
-            .ok()
-            .flatten();
-
-        match next_href {
-            Some(h) if h != "clicked" && h != current => current = h,
-            Some(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        if let Some(re) = &link_re {
+            if !re.is_match(&href) {
+                continue;
             }
-            None => break,
         }
+        if !seen.insert(href.clone()) {
+            continue;
+        }
+        let ts = card
+            .date_text
+            .as_deref()
+            .and_then(parse_date_from_text)
+            .map(date_to_utc)
+            .unwrap_or_else(Utc::now);
+        let title = card
+            .title
+            .filter(|t| t.len() >= 2)
+            .unwrap_or_else(|| "Untitled job".into());
+        items.push(ScrapedItem {
+            source_id: source_id.to_string(),
+            external_id: external_id_for_url(&href),
+            item_timestamp: ts,
+            title: title.chars().take(300).collect(),
+            url: href,
+            company: card.company.filter(|s| !s.is_empty()),
+            location: card.location.filter(|s| !s.is_empty()),
+            salary: None,
+            description: None,
+        });
     }
 
     Ok(items)
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct PlaywrightListResponse {
+    #[serde(default)]
+    cards: Vec<DomCardExtract>,
+    #[serde(default)]
+    pages_visited: i32,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize)]
@@ -799,7 +753,7 @@ where
     F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let page = browser.new_page("about:blank").await?;
+    let page = prepare_page(&browser).await?;
     let mut stats = ScrapeStats::default();
     let mut consecutive_failures = 0i32;
     let mut current_url = listing_url.to_string();

@@ -91,7 +91,7 @@ VALUES (
         "source": "dom",
         "dom": {
           "wait_for": "div.job-listing",
-          "wait_ms": 3000,
+          "wait_ms": 5000,
           "card_selector": "div.job-listing",
           "title_selector": "h1.job-title > a",
           "company_selector": "h1.job-title small a",

@@ -13,6 +13,7 @@ Open [http://localhost:8080](http://localhost:8080).
 
 - **TimescaleDB:** `localhost:5432` — user `postgres` / password `password` / db `scrapers_db`
 - **App:** `localhost:8080`
+- **Playwright worker:** `localhost:3001` (DOM listing scrapes, headed Chromium under Xvfb)
 - **Env:** see `.env.example` (copy to `.env`; `.env` is gitignored)
 
 ## Local (without Docker app)
@@ -22,7 +23,8 @@ Open [http://localhost:8080](http://localhost:8080).
 docker compose up timescaledb -d
 
 export DATABASE_URL="postgres://postgres:password@localhost:5432/scrapers_db"
-export CHROME_PATH="$(which chromium || which google-chrome || which chromium-browser)"
+export PLAYWRIGHT_URL="http://localhost:3001"
+docker compose up playwright -d
 cargo run
 ```
 

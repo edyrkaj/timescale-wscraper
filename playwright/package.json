@@ -1,0 +1,8 @@
+{
+  "name": "playwright-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.50.1"
+  }
+}

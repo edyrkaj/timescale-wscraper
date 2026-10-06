@@ -50,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
     let browser = match BrowserPool::try_launch().await {
         Ok(pool) => Some(Arc::new(pool)),
         Err(err) => {
-            tracing::warn!(error = %err, "Chromium unavailable; API-based patterns will still work");
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "Chromium unavailable; API-based patterns will still work"
+            );
             None
         }
     };
