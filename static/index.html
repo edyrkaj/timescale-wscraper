@@ -41,9 +41,22 @@
             </span>
           </label>
         </div>
-        <label class="ai-toggle">
-          <input id="use_ai" name="use_ai" type="checkbox" />
-          AI Scraper
+        <label class="ai-toggle" for="use_ai">
+          <span class="ai-toggle-text">
+            <strong>AI Scraper</strong>
+            <small>Use LLM extraction instead of CSS/API patterns</small>
+          </span>
+          <span class="switch">
+            <input id="use_ai" name="use_ai" type="checkbox" />
+            <span class="switch-track" aria-hidden="true"></span>
+          </span>
+        </label>
+        <label id="ai-provider-wrap" class="ai-provider" hidden>
+          AI provider
+          <select id="ai_provider" name="ai_provider">
+            <option value="anthropic">Anthropic (Meta / Muse)</option>
+            <option value="gemini">Google Gemini</option>
+          </select>
         </label>
         <div class="actions">
           <button type="submit" id="start-btn">Start scraping</button>
@@ -64,30 +77,35 @@
       <p id="message" class="message">Waiting for a job…</p>
     </section>
 
-    <section class="controls">
-      <h2>Scrape patterns</h2>
-      <p class="hint">Patterns teach the scraper how to find list items and open detail pages (e.g. Tirana <code>/shpalljet</code> → <code>/shpalljet/{id}</code>).</p>
-      <form id="pattern-form">
-        <div class="row">
+    <section class="controls collapsible collapsed" id="patterns-section">
+      <button type="button" class="collapse-toggle" id="patterns-toggle" aria-expanded="false" aria-controls="patterns-body">
+        <h2>Scrape patterns</h2>
+        <span class="collapse-chevron" aria-hidden="true">▾</span>
+      </button>
+      <div id="patterns-body" class="collapse-body" hidden>
+        <p class="hint">Patterns teach the scraper how to find list items and open detail pages (e.g. Tirana <code>/shpalljet</code> → <code>/shpalljet/{id}</code>).</p>
+        <form id="pattern-form">
+          <div class="row">
+            <label>
+              Name
+              <input id="pattern_name" required placeholder="Tirana E-rekrutim" />
+            </label>
+            <label>
+              URL match substring
+              <input id="pattern_match" required placeholder="rekrutimi.tirana.al/shpalljet" />
+            </label>
+          </div>
           <label>
-            Name
-            <input id="pattern_name" required placeholder="Tirana E-rekrutim" />
+            Config JSON
+            <textarea id="pattern_config" rows="12" required></textarea>
           </label>
-          <label>
-            URL match substring
-            <input id="pattern_match" required placeholder="rekrutimi.tirana.al/shpalljet" />
-          </label>
-        </div>
-        <label>
-          Config JSON
-          <textarea id="pattern_config" rows="12" required></textarea>
-        </label>
-        <div class="actions">
-          <button type="submit">Save pattern</button>
-          <button type="button" id="pattern-reset" class="secondary">Reset form</button>
-        </div>
-      </form>
-      <ul id="patterns"></ul>
+          <div class="actions">
+            <button type="submit">Save pattern</button>
+            <button type="button" id="pattern-reset" class="secondary">Reset form</button>
+          </div>
+        </form>
+        <ul id="patterns"></ul>
+      </div>
     </section>
 
     <section class="lists">
@@ -101,6 +119,7 @@
       </div>
     </section>
   </main>
+  <script src="/config.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

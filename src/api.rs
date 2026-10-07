@@ -39,6 +39,7 @@ pub async fn create_job(
             body.to_date,
             body.pattern_id,
             body.use_ai,
+            body.ai_provider.as_deref(),
         )
         .await
     {
@@ -52,7 +53,14 @@ pub async fn create_job(
                 message: format!(
                     "Enqueued job {}{}",
                     job.id,
-                    if job.use_ai { " (AI scrape)" } else { "" }
+                    if job.use_ai {
+                        match job.ai_provider.as_deref() {
+                            Some("gemini") => " (AI scrape · Gemini)",
+                            _ => " (AI scrape · Anthropic)",
+                        }
+                    } else {
+                        ""
+                    }
                 ),
             });
             (axum::http::StatusCode::CREATED, Json(job)).into_response()
@@ -106,6 +114,7 @@ pub async fn restart_job(
                 job.to_date,
                 job.pattern_id,
                 job.use_ai,
+                job.ai_provider.as_deref(),
             )
             .await
         {

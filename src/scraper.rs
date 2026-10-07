@@ -115,6 +115,7 @@ pub async fn scrape_listing<F, Fut>(
     to_date: NaiveDate,
     pattern: Option<&PatternConfig>,
     use_ai: bool,
+    ai_provider: crate::models::AiProvider,
     cancel: CancellationToken,
     on_batch: F,
 ) -> Result<ScrapeStats>
@@ -123,8 +124,16 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     if use_ai {
-        info!("using AI scrape (LLM extraction)");
-        return scrape_with_ai(listing_url, from_date, to_date, cancel, on_batch).await;
+        info!(provider = %ai_provider.as_str(), "using AI scrape (LLM extraction)");
+        return scrape_with_ai(
+            listing_url,
+            from_date,
+            to_date,
+            ai_provider,
+            cancel,
+            on_batch,
+        )
+        .await;
     }
 
     let inferred;
@@ -150,6 +159,7 @@ async fn scrape_with_ai<F, Fut>(
     listing_url: &str,
     from_date: NaiveDate,
     to_date: NaiveDate,
+    ai_provider: crate::models::AiProvider,
     cancel: CancellationToken,
     mut on_batch: F,
 ) -> Result<ScrapeStats>
@@ -157,7 +167,7 @@ where
     F: FnMut(Vec<ScrapedItem>, i32, i32) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let cfg = crate::ai::LlmConfig::from_env()?;
+    let cfg = crate::ai::LlmConfig::from_env(ai_provider)?;
     let source_id = source_id_from_url(listing_url)?;
     let origin = Url::parse(listing_url).context("invalid listing URL")?;
 
@@ -198,6 +208,8 @@ where
                 location: item.location,
                 salary: item.salary,
                 description: item.description,
+                job_id: None,
+                job_inserted_at: None,
             });
             if stats.scraped_count + batch.len() as i32 >= MAX_ITEMS {
                 break;
@@ -634,6 +646,8 @@ async fn collect_from_api(
                 location,
                 salary,
                 description,
+                job_id: None,
+                job_inserted_at: None,
             });
         }
 
@@ -744,6 +758,8 @@ async fn collect_from_dom(
             location: card.location.filter(|s| !s.is_empty()),
             salary: None,
             description: None,
+            job_id: None,
+            job_inserted_at: None,
         });
     }
 
@@ -1043,6 +1059,8 @@ async fn scrape_page_heuristic(
             location,
             salary,
             description: Some(anchor.parent_text.chars().take(500).collect()),
+            job_id: None,
+            job_inserted_at: None,
         });
 
         if items.len() as i32 >= MAX_ITEMS {

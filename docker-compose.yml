@@ -33,12 +33,30 @@ services:
       USE_XVFB: ${USE_XVFB:-1}
       HEADLESS: ${HEADLESS:-0}
       DISPLAY: ${DISPLAY:-:99}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.meta.ai}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-${MODEL_API_KEY:-}}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-muse-spark-1.3-contributor}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      GEMINI_FALLBACK_MODELS: ${GEMINI_FALLBACK_MODELS:-}
     depends_on:
       timescaledb:
         condition: service_healthy
       playwright:
         condition: service_healthy
     shm_size: "1gb"
+
+  ui:
+    image: nginx:1.27-alpine
+    ports:
+      - "${UI_PORT:-3000}:80"
+    volumes:
+      - ./static:/usr/share/nginx/html:ro
+      - ./ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
 
   playwright:
     build: ./playwright

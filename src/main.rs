@@ -11,11 +11,9 @@ use db::Db;
 use queue::QueueHandle;
 use scraper::BrowserPool;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -69,9 +67,6 @@ async fn main() -> anyhow::Result<()> {
         events,
     };
 
-    let static_dir = resolve_static_dir();
-    let index = static_dir.join("index.html");
-
     let app = Router::new()
         .route("/api/jobs", post(api::create_job).get(api::list_jobs))
         .route("/api/jobs/stream", get(api::job_stream))
@@ -86,30 +81,13 @@ async fn main() -> anyhow::Result<()> {
             "/api/patterns/{id}",
             put(api::update_pattern).delete(api::delete_pattern),
         )
-        .fallback_service(
-            ServeDir::new(&static_dir).not_found_service(ServeFile::new(index)),
-        )
+        .route("/health", get(|| async { "ok" }))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr: SocketAddr = bind_addr.parse()?;
-    info!("listening on http://{addr}");
+    info!("API listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn resolve_static_dir() -> PathBuf {
-    let candidates = [
-        PathBuf::from("static"),
-        PathBuf::from("/app/static"),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("static")))
-            .unwrap_or_else(|| PathBuf::from("static")),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("index.html").exists())
-        .unwrap_or_else(|| PathBuf::from("static"))
 }

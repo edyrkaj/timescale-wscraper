@@ -158,6 +158,7 @@ impl QueueHandle {
 
         let browser = self.browser.as_ref().map(|b| b.browser());
         let ai_progress = job.use_ai;
+        let ai_provider = crate::models::AiProvider::parse(job.ai_provider.as_deref());
 
         let stats = scraper::scrape_listing(
             browser,
@@ -166,12 +167,13 @@ impl QueueHandle {
             job.to_date,
             pattern_cfg.as_ref(),
             job.use_ai,
+            ai_provider,
             token.clone(),
             |items, scraped_count, pages_visited| {
                 let db = db.clone();
                 let events = events.clone();
                 async move {
-                    db.save_items(&items).await?;
+                    db.save_items(&items, job_id).await?;
                     db.update_job_progress(job_id, scraped_count, pages_visited)
                         .await?;
                     let current = db.get_job(job_id).await?;
@@ -182,7 +184,10 @@ impl QueueHandle {
                         scraped_count,
                         status: "running".into(),
                         message: if ai_progress {
-                            format!("AI scrape… saved batch; total {scraped_count}")
+                            format!(
+                                "AI scrape ({})… saved batch; total {scraped_count}",
+                                ai_provider.as_str()
+                            )
                         } else {
                             format!("Saved batch; total {scraped_count}")
                         },

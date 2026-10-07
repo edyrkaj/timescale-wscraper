@@ -12,14 +12,50 @@ const patternSelect = document.getElementById("pattern_id");
 const patternForm = document.getElementById("pattern-form");
 const patternConfig = document.getElementById("pattern_config");
 const useAi = document.getElementById("use_ai");
+const aiProviderWrap = document.getElementById("ai-provider-wrap");
+const aiProvider = document.getElementById("ai_provider");
+const patternsSection = document.getElementById("patterns-section");
+const patternsToggle = document.getElementById("patterns-toggle");
+const patternsBody = document.getElementById("patterns-body");
+
+function resolveApiBase() {
+  const configured = String(window.API_BASE || "")
+    .trim()
+    .replace(/\/$/, "");
+  if (configured) return configured;
+  // Separate UI ports talk to the API on 8080
+  if (["3000", "5173", "5500"].includes(location.port)) {
+    return `${location.protocol}//${location.hostname}:8080`;
+  }
+  return "";
+}
+
+const API_BASE = resolveApiBase();
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`;
+}
+
+function setPatternsOpen(open) {
+  patternsSection.classList.toggle("collapsed", !open);
+  patternsBody.hidden = !open;
+  patternsToggle.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+patternsToggle.addEventListener("click", () => {
+  setPatternsOpen(patternsBody.hidden);
+});
 
 function syncAiToggle() {
   const on = useAi.checked;
   patternSelect.disabled = on;
   if (on) patternSelect.value = "";
+  aiProviderWrap.hidden = !on;
+  aiProvider.disabled = !on;
 }
 
 useAi.addEventListener("change", syncAiToggle);
+syncAiToggle();
 
 let selectedJobId = null;
 let currentRunningId = null;
@@ -264,8 +300,9 @@ form.addEventListener("submit", async (e) => {
     to_date: document.getElementById("to_date").value,
     pattern_id: patternId,
     use_ai: useAi.checked,
+    ai_provider: useAi.checked ? aiProvider.value : null,
   };
-  const res = await fetch("/api/jobs", {
+  const res = await fetch(apiUrl("/api/jobs"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -277,7 +314,11 @@ form.addEventListener("submit", async (e) => {
   }
   selectedJobId = data.id;
   message.textContent = `Enqueued ${data.id}${
-    data.use_ai ? " (AI scrape)" : data.pattern_id ? " (pattern attached)" : ""
+    data.use_ai
+      ? ` (AI · ${data.ai_provider || "anthropic"})`
+      : data.pattern_id
+        ? " (pattern attached)"
+        : ""
   }`;
   restartBtn.disabled = false;
   await refreshJobs();
@@ -286,7 +327,7 @@ form.addEventListener("submit", async (e) => {
 stopBtn.addEventListener("click", async () => {
   const id = currentRunningId || selectedJobId;
   if (!id) return;
-  const res = await fetch(`/api/jobs/${id}/stop`, { method: "POST" });
+  const res = await fetch(apiUrl(`/api/jobs/${id}/stop`), { method: "POST" });
   const data = await res.json();
   message.textContent = data.error || "Stop requested";
   await refreshJobs();
@@ -294,7 +335,7 @@ stopBtn.addEventListener("click", async () => {
 
 restartBtn.addEventListener("click", async () => {
   if (!selectedJobId) return;
-  const res = await fetch(`/api/jobs/${selectedJobId}/restart`, { method: "POST" });
+  const res = await fetch(apiUrl(`/api/jobs/${selectedJobId}/restart`), { method: "POST" });
   const data = await res.json();
   if (!res.ok) {
     message.textContent = data.error || "Restart failed";
@@ -320,7 +361,9 @@ patternForm.addEventListener("submit", async (e) => {
     config,
     enabled: true,
   };
-  const url = editingPatternId ? `/api/patterns/${editingPatternId}` : "/api/patterns";
+  const url = editingPatternId
+    ? apiUrl(`/api/patterns/${editingPatternId}`)
+    : apiUrl("/api/patterns");
   const method = editingPatternId ? "PUT" : "POST";
   const res = await fetch(url, {
     method,
@@ -374,14 +417,14 @@ function applyProgress(evt) {
 }
 
 async function refreshJobs() {
-  const res = await fetch("/api/jobs");
+  const res = await fetch(apiUrl("/api/jobs"));
   const jobs = await res.json();
   jobsEl.innerHTML = "";
   for (const job of jobs) {
     const li = document.createElement("li");
     if (job.id === selectedJobId) li.classList.add("selected");
     const patternName = job.use_ai
-      ? "AI scraper"
+      ? `AI · ${job.ai_provider || "anthropic"}`
       : patternsCache.find((p) => p.id === job.pattern_id)?.name || (job.pattern_id ? job.pattern_id.slice(0, 8) : "heuristic");
     li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${job.pages_visited} pages · ${escapeHtml(patternName)}</div>
       <div class="meta">${escapeHtml(job.listing_url)}</div>
@@ -396,7 +439,7 @@ async function refreshJobs() {
 }
 
 async function refreshItems() {
-  const res = await fetch("/api/items");
+  const res = await fetch(apiUrl("/api/items"));
   const items = await res.json();
   itemsEl.innerHTML = "";
   for (const item of items) {
@@ -408,7 +451,7 @@ async function refreshItems() {
 }
 
 async function refreshPatterns() {
-  const res = await fetch("/api/patterns");
+  const res = await fetch(apiUrl("/api/patterns"));
   patternsCache = await res.json();
   const previous = patternSelect.value;
   patternSelect.innerHTML = `<option value="">Auto / heuristic</option>`;
@@ -438,13 +481,14 @@ async function refreshPatterns() {
       document.getElementById("pattern_name").value = p.name;
       document.getElementById("pattern_match").value = p.url_match;
       patternConfig.value = JSON.stringify(p.config, null, 2);
+      setPatternsOpen(true);
       message.textContent = `Editing pattern ${p.name}`;
     });
   });
   patternsEl.querySelectorAll("[data-del]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (!confirm("Delete this pattern?")) return;
-      await fetch(`/api/patterns/${btn.dataset.del}`, { method: "DELETE" });
+      await fetch(apiUrl(`/api/patterns/${btn.dataset.del}`), { method: "DELETE" });
       await refreshPatterns();
     });
   });
@@ -459,7 +503,7 @@ function escapeHtml(s) {
 }
 
 function connectSse() {
-  const es = new EventSource("/api/jobs/stream");
+  const es = new EventSource(apiUrl("/api/jobs/stream"));
   es.addEventListener("progress", (e) => {
     try {
       applyProgress(JSON.parse(e.data));

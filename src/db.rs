@@ -51,6 +51,42 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            ALTER TABLE scrape_jobs
+            ADD COLUMN IF NOT EXISTS ai_provider TEXT
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE scraped_items
+            ADD COLUMN IF NOT EXISTS job_id UUID
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE scraped_items
+            ADD COLUMN IF NOT EXISTS job_inserted_at TIMESTAMPTZ
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS scraped_items_job_id_idx
+            ON scraped_items (job_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Seed / refresh known e-rekrutim patterns (API list — no Chromium required)
         let tirana_config = serde_json::json!({
             "list": {
@@ -141,15 +177,15 @@ impl Db {
         Ok(())
     }
 
-    pub async fn save_items(&self, items: &[ScrapedItem]) -> Result<u64> {
+    pub async fn save_items(&self, items: &[ScrapedItem], job_id: Uuid) -> Result<u64> {
         let mut saved = 0u64;
         for item in items {
             let description = item.description.as_ref().map(|d| encode_description(d));
             let result = sqlx::query(
                 r#"
                 INSERT INTO scraped_items
-                    (source_id, external_id, item_timestamp, title, url, company, location, salary, description)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    (source_id, external_id, item_timestamp, title, url, company, location, salary, description, job_id, job_inserted_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
                 ON CONFLICT (source_id, external_id, item_timestamp)
                 DO UPDATE SET
                     title = EXCLUDED.title,
@@ -157,7 +193,9 @@ impl Db {
                     company = EXCLUDED.company,
                     location = EXCLUDED.location,
                     salary = EXCLUDED.salary,
-                    description = EXCLUDED.description
+                    description = EXCLUDED.description,
+                    job_id = EXCLUDED.job_id,
+                    job_inserted_at = EXCLUDED.job_inserted_at
                 "#,
             )
             .bind(&item.source_id)
@@ -169,6 +207,7 @@ impl Db {
             .bind(&item.location)
             .bind(&item.salary)
             .bind(&description)
+            .bind(job_id)
             .execute(&self.pool)
             .await?;
             saved += result.rows_affected();
@@ -183,6 +222,7 @@ impl Db {
         to_date: NaiveDate,
         pattern_id: Option<Uuid>,
         use_ai: bool,
+        ai_provider: Option<&str>,
     ) -> Result<ScrapeJob> {
         let id = Uuid::new_v4();
         let resolved_pattern = if use_ai {
@@ -196,11 +236,20 @@ impl Db {
                     .map(|p| p.id),
             }
         };
+        let provider = if use_ai {
+            Some(
+                crate::models::AiProvider::parse(ai_provider)
+                    .as_str()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
 
         let job = sqlx::query_as::<_, ScrapeJob>(
             r#"
-            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id, use_ai)
-            VALUES ($1, $2, $3, $4, 'queued', $5, $6)
+            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id, use_ai, ai_provider)
+            VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7)
             RETURNING *
             "#,
         )
@@ -210,6 +259,7 @@ impl Db {
         .bind(to_date)
         .bind(resolved_pattern)
         .bind(use_ai)
+        .bind(provider)
         .fetch_one(&self.pool)
         .await?;
         Ok(job)

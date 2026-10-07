@@ -1,6 +1,8 @@
 # Timescale Job Scraper
 
-Generic Docker-local job-board scraper: paste a listing URL + date range, scrape with headless Chromium, store jobs in TimescaleDB, control a sequential queue from a web UI.
+Generic Docker-local job-board scraper: paste a listing URL + date range, scrape jobs into TimescaleDB, control a sequential queue from a web UI.
+
+The **UI** and **API** run as separate services.
 
 ## Quick start
 
@@ -9,23 +11,37 @@ cp .env.example .env   # optional; defaults work out of the box
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080).
+Open [http://localhost:3000](http://localhost:3000) (UI). API is on [http://localhost:8080](http://localhost:8080).
 
-- **TimescaleDB:** `localhost:5432` — user `postgres` / password `password` / db `scrapers_db`
-- **App:** `localhost:8080`
-- **Playwright worker:** `localhost:3001` (DOM listing scrapes, headed Chromium under Xvfb)
-- **Env:** see `.env.example` (copy to `.env`; `.env` is gitignored)
+| Service | URL / port |
+|---------|------------|
+| **UI** | `localhost:3000` |
+| **API** | `localhost:8080` |
+| **TimescaleDB** | `localhost:5432` — user `postgres` / password `password` / db `scrapers_db` |
+| **Playwright worker** | `localhost:3001` (DOM listing scrapes) |
 
-## Local (without Docker app)
+Env: see `.env.example` (copy to `.env`; `.env` is gitignored).
+
+## Local (split processes)
 
 ```bash
-# Start only the DB
-docker compose up timescaledb -d
+# DB + Playwright
+docker compose up timescaledb playwright -d
 
+# API
 export DATABASE_URL="postgres://postgres:password@localhost:5432/scrapers_db"
 export PLAYWRIGHT_URL="http://localhost:3001"
-docker compose up playwright -d
 cargo run
+
+# UI (separate terminal) — serves static/ on :3000; auto-targets API on :8080
+docker compose up ui -d
+# or: cd static && python3 -m http.server 3000
+```
+
+Override the API URL in [`static/config.js`](static/config.js) if needed:
+
+```js
+window.API_BASE = "http://127.0.0.1:8080";
 ```
 
 ## Scrape patterns (list → detail)
@@ -34,9 +50,11 @@ Sites like [Tirana E-rekrutim](https://rekrutimi.tirana.al/shpalljet) list jobs 
 
 Patterns are stored in Timescale (`scrape_patterns`) and editable in the UI:
 
-1. Open **http://localhost:8080**
-2. Under **Scrape patterns**, create/edit a pattern (`url_match` + JSON config)
+1. Open **http://localhost:3000**
+2. Expand **Scrape patterns**, create/edit a pattern (`url_match` + JSON config)
 3. Start a scrape with a matching listing URL — the pattern is auto-attached
+
+Enable **AI Scraper** and pick a provider from the dropdown (**Anthropic** or **Gemini**).
 
 The Tirana pattern is seeded automatically. It uses the public list API, then opens each detail page for title/company/description enrichment.
 
@@ -44,7 +62,7 @@ The Tirana pattern is seeded automatically. It uses the public list API, then op
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/` | UI |
+| GET | `/health` | Health check |
 | POST | `/api/jobs` | Enqueue scrape |
 | GET | `/api/jobs` | List jobs |
 | POST | `/api/jobs/{id}/stop` | Stop job |

@@ -13,6 +13,10 @@ pub struct ScrapedItem {
     pub location: Option<String>,
     pub salary: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<Uuid>,
+    #[serde(default)]
+    pub job_inserted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +41,35 @@ impl JobStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProvider {
+    Anthropic,
+    Gemini,
+}
+
+impl AiProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("gemini") => Self::Gemini,
+            _ => Self::Anthropic,
+        }
+    }
+}
+
+impl Default for AiProvider {
+    fn default() -> Self {
+        Self::Anthropic
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ScrapeJob {
     pub id: Uuid,
@@ -53,6 +86,7 @@ pub struct ScrapeJob {
     pub pattern_id: Option<Uuid>,
     #[serde(default)]
     pub use_ai: bool,
+    pub ai_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +97,8 @@ pub struct CreateJobRequest {
     pub pattern_id: Option<Uuid>,
     #[serde(default)]
     pub use_ai: bool,
+    #[serde(default)]
+    pub ai_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

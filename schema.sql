@@ -13,10 +13,15 @@ CREATE TABLE IF NOT EXISTS scraped_items (
     location TEXT,
     salary TEXT,
     description TEXT,
+    job_id UUID,
+    job_inserted_at TIMESTAMPTZ,
     PRIMARY KEY (source_id, external_id, item_timestamp)
 );
 
 SELECT create_hypertable('scraped_items', 'item_timestamp', if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS scraped_items_job_id_idx
+    ON scraped_items (job_id);
 
 CREATE TABLE IF NOT EXISTS scrape_jobs (
     id UUID PRIMARY KEY,
@@ -31,7 +36,8 @@ CREATE TABLE IF NOT EXISTS scrape_jobs (
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     pattern_id UUID,
-    use_ai BOOLEAN NOT NULL DEFAULT FALSE
+    use_ai BOOLEAN NOT NULL DEFAULT FALSE,
+    ai_provider TEXT
 );
 
 CREATE INDEX IF NOT EXISTS scrape_jobs_status_created_idx
