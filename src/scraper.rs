@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::Page;
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
 use futures_util::StreamExt;
 use regex::Regex;
 use serde_json::Value;
@@ -77,13 +77,11 @@ impl BrowserPool {
             .build()
             .map_err(|e| anyhow!("browser config: {e}"))?;
 
-        let (browser, mut handler) = Browser::launch(config).await.with_context(|| {
-            format!("failed to launch Chromium at {chrome}")
-        })?;
+        let (browser, mut handler) = Browser::launch(config)
+            .await
+            .with_context(|| format!("failed to launch Chromium at {chrome}"))?;
 
-        tokio::spawn(async move {
-            while let Some(_event) = handler.next().await {}
-        });
+        tokio::spawn(async move { while let Some(_event) = handler.next().await {} });
 
         Ok(Self {
             browser: Arc::new(browser),
@@ -147,8 +145,16 @@ where
 
     if let Some(cfg) = cfg {
         info!("using pattern-based scrape (API/DOM)");
-        return scrape_with_pattern(browser, listing_url, from_date, to_date, cfg, cancel, on_batch)
-            .await;
+        return scrape_with_pattern(
+            browser,
+            listing_url,
+            from_date,
+            to_date,
+            cfg,
+            cancel,
+            on_batch,
+        )
+        .await;
     }
 
     let browser = browser.context("no scrape pattern matched and Chromium is unavailable")?;
@@ -188,9 +194,11 @@ where
         info!(url = %current, page = stats.pages_visited, "AI scrape: fetching page");
         let page = fetch_page_via_playwright(&current, &cancel).await?;
         let extract =
-            crate::ai::extract_jobs_from_page(&cfg, listing_url, from_date, to_date, &page)
-                .await?;
-        let next_raw = extract.next_page_url.clone();
+            crate::ai::extract_jobs_from_page(&cfg, listing_url, from_date, to_date, &page).await?;
+        let next_raw = extract.next_page_url.clone().or_else(|| {
+            crate::ai::listing_next_url(&page.final_url, &page.links)
+                .or_else(|| crate::ai::listing_next_url(&current, &page.links))
+        });
         let (kept, saw_older) = crate::ai::filter_extract(extract, from_date, to_date);
 
         let mut batch = Vec::new();
@@ -237,13 +245,11 @@ where
     Ok(stats)
 }
 
-fn resolve_same_origin_next(
-    listing: &Url,
-    final_url: &str,
-    next: Option<&str>,
-) -> Option<String> {
+fn resolve_same_origin_next(listing: &Url, final_url: &str, next: Option<&str>) -> Option<String> {
     let next = next.map(str::trim).filter(|s| !s.is_empty())?;
-    let base = Url::parse(final_url).ok().unwrap_or_else(|| listing.clone());
+    let base = Url::parse(final_url)
+        .ok()
+        .unwrap_or_else(|| listing.clone());
     let resolved = base.join(next).ok().or_else(|| Url::parse(next).ok())?;
     if resolved.host_str()? != listing.host_str()? {
         return None;
@@ -430,12 +436,7 @@ where
                         break;
                     }
                     // Extract id from detail URL path last segment
-                    let id = item
-                        .url
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
+                    let id = item.url.rsplit('/').next().unwrap_or("").to_string();
                     let url = template.replace("{id}", &id);
                     match client.get(&url).send().await {
                         Ok(res) if res.status().is_success() => {
@@ -505,7 +506,12 @@ where
         if batch.len() >= 25 {
             let batch_len = batch.len() as i32;
             stats.scraped_count += batch_len;
-            on_batch(std::mem::take(&mut batch), stats.scraped_count, stats.pages_visited).await?;
+            on_batch(
+                std::mem::take(&mut batch),
+                stats.scraped_count,
+                stats.pages_visited,
+            )
+            .await?;
         }
     }
     if !batch.is_empty() {
@@ -581,9 +587,11 @@ async fn collect_from_api(
         let arr_len = arr.len();
         for entry in arr {
             let id = json_path(&entry, &api.id_path)
-                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| {
-                    v.as_i64().map(|n| n.to_string())
-                }))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                })
                 .unwrap_or_else(|| external_id_for_url(&entry.to_string()));
 
             let published = api
@@ -637,9 +645,7 @@ async fn collect_from_api(
             items.push(ScrapedItem {
                 source_id: source_id.to_string(),
                 external_id: external_id_for_url(&detail_url),
-                item_timestamp: published
-                    .map(date_to_utc)
-                    .unwrap_or_else(Utc::now),
+                item_timestamp: published.map(date_to_utc).unwrap_or_else(Utc::now),
                 title,
                 url: detail_url,
                 company,
@@ -702,10 +708,8 @@ async fn collect_from_dom(
     };
 
     let status = res.status();
-    let body: PlaywrightListResponse = res
-        .json()
-        .await
-        .context("invalid Playwright worker JSON")?;
+    let body: PlaywrightListResponse =
+        res.json().await.context("invalid Playwright worker JSON")?;
     stats.pages_visited = body.pages_visited.max(stats.pages_visited);
     if !status.is_success() {
         anyhow::bail!(
@@ -1031,7 +1035,10 @@ async fn scrape_page_heuristic(
         };
 
         let company = guess_field(&anchor.parent_text, &["company", "employer", "at "]);
-        let location = guess_field(&anchor.parent_text, &["location", "remote", "hybrid", "onsite"]);
+        let location = guess_field(
+            &anchor.parent_text,
+            &["location", "remote", "hybrid", "onsite"],
+        );
         let salary = guess_salary(&anchor.parent_text);
         let parsed_date = parse_date_from_text(&anchor.parent_text);
 
@@ -1242,9 +1249,10 @@ fn parse_date_from_text(text: &str) -> Option<NaiveDate> {
         ("dec", 12),
     ];
     for (name, month) in months {
-        let re =
-            Regex::new(&format!(r"(?i)\b{name}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s+(20\d{{2}}))?\b"))
-                .ok()?;
+        let re = Regex::new(&format!(
+            r"(?i)\b{name}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s+(20\d{{2}}))?\b"
+        ))
+        .ok()?;
         if let Some(caps) = re.captures(text) {
             let day: u32 = caps.get(1)?.as_str().parse().ok()?;
             let year: i32 = caps

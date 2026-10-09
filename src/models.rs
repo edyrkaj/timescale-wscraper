@@ -46,6 +46,7 @@ impl JobStatus {
 pub enum AiProvider {
     Anthropic,
     Gemini,
+    Vllm,
 }
 
 impl AiProvider {
@@ -53,12 +54,14 @@ impl AiProvider {
         match self {
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::Vllm => "vllm",
         }
     }
 
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("gemini") => Self::Gemini,
+            Some("vllm") | Some("qwen") => Self::Vllm,
             _ => Self::Anthropic,
         }
     }

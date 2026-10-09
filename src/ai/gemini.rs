@@ -26,15 +26,13 @@ pub struct GeminiProvider;
 
 impl GeminiProvider {
     pub fn config_from_env() -> Result<LlmConfig> {
-        let api_key = env_nonempty("GEMINI_API_KEY").context(
-            "GEMINI_API_KEY is required for Gemini AI scraper — add it to your .env",
-        )?;
+        let api_key = env_nonempty("GEMINI_API_KEY")
+            .context("GEMINI_API_KEY is required for Gemini AI scraper — add it to your .env")?;
         let base_url = env_nonempty("GEMINI_BASE_URL")
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();
-        let model =
-            env_nonempty("GEMINI_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model = env_nonempty("GEMINI_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Ok(LlmConfig {
             provider: AiProvider::Gemini,
             base_url,
@@ -52,7 +50,8 @@ impl GeminiProvider {
                 Ok(parsed) => return Ok(parsed),
                 Err(err) => {
                     let msg = err.to_string();
-                    if is_transient(&msg) && model.as_str() != models.last().map(String::as_str).unwrap_or("")
+                    if is_transient(&msg)
+                        && model.as_str() != models.last().map(String::as_str).unwrap_or("")
                     {
                         warn!(%model, error = %msg, "Gemini transient failure; trying next model");
                         last_err = Some(err);

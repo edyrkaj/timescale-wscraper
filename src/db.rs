@@ -181,6 +181,21 @@ impl Db {
         let mut saved = 0u64;
         for item in items {
             let description = item.description.as_ref().map(|d| encode_description(d));
+            // The primary key includes item_timestamp. Undated jobs would otherwise
+            // insert a new row on every run because the timestamp is "now".
+            let existing_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
+                r#"
+                SELECT item_timestamp FROM scraped_items
+                WHERE source_id = $1 AND external_id = $2
+                ORDER BY item_timestamp DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(&item.source_id)
+            .bind(&item.external_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            let item_timestamp = existing_ts.unwrap_or(item.item_timestamp);
             let result = sqlx::query(
                 r#"
                 INSERT INTO scraped_items
@@ -200,7 +215,7 @@ impl Db {
             )
             .bind(&item.source_id)
             .bind(&item.external_id)
-            .bind(item.item_timestamp)
+            .bind(item_timestamp)
             .bind(&item.title)
             .bind(&item.url)
             .bind(&item.company)
@@ -230,10 +245,7 @@ impl Db {
         } else {
             match pattern_id {
                 Some(pid) => Some(pid),
-                None => self
-                    .find_pattern_for_url(listing_url)
-                    .await?
-                    .map(|p| p.id),
+                None => self.find_pattern_for_url(listing_url).await?.map(|p| p.id),
             }
         };
         let provider = if use_ai {
@@ -405,21 +417,19 @@ impl Db {
     }
 
     pub async fn get_last_watermark(&self, source_id: &str) -> Result<Option<DateTime<Utc>>> {
-        let row: (Option<DateTime<Utc>>,) = sqlx::query_as(
-            "SELECT MAX(item_timestamp) FROM scraped_items WHERE source_id = $1",
-        )
-        .bind(source_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row: (Option<DateTime<Utc>>,) =
+            sqlx::query_as("SELECT MAX(item_timestamp) FROM scraped_items WHERE source_id = $1")
+                .bind(source_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.0)
     }
 
     pub async fn list_patterns(&self) -> Result<Vec<ScrapePattern>> {
-        let rows = sqlx::query_as::<_, ScrapePattern>(
-            "SELECT * FROM scrape_patterns ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query_as::<_, ScrapePattern>("SELECT * FROM scrape_patterns ORDER BY name ASC")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
