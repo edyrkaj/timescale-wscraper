@@ -305,6 +305,53 @@ mod tests {
         assert_eq!(max_tokens, 1024);
     }
 
+    /// Live check against a local vLLM server. The model has no weather feed, so this
+    /// only checks that a short Tirana question comes back as text.
+    ///
+    /// `cargo test --bin rust_scraper_timescale asks_vllm_for_tirana_weather -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn asks_vllm_for_calculator() {
+        let base =
+            env_nonempty("VLLM_BASE_URL").unwrap_or_else(|| "http://127.0.0.1:8000/v1".into());
+        let model = env_nonempty("VLLM_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let endpoint = chat_completions_url(&base);
+        let body = serde_json::json!({
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 256,
+            "chat_template_kwargs": { "enable_thinking": false },
+            "messages": [
+                { "role": "system", "content": "Answer in one or two short sentences." },
+                { "role": "user", "content": "What is the sum of two numbers 4 and 9" }
+            ]
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .expect("client");
+        let mut req = client
+            .post(&endpoint)
+            .header("content-type", "application/json");
+        if let Some(auth) = authorization_header(&env_nonempty("VLLM_API_KEY").unwrap_or_default())
+        {
+            req = req.header("Authorization", auth);
+        }
+        let res = req.json(&body).send().await.expect("vLLM reachable");
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "vLLM HTTP {status}: {}",
+            text.chars().take(400).collect::<String>()
+        );
+        let result = message_content(&text).expect("content");
+        println!("  calculator reply: {result}");
+        let lower = result.to_ascii_lowercase();
+        assert!(lower.contains("13"), "reply did not mention calculator: {result}");
+    }
+
     #[test]
     fn strips_think_block_before_json() {
         let raw =
