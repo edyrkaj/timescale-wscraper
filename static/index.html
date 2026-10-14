@@ -59,6 +59,10 @@
             <option value="vllm">Local vLLM (Qwen)</option>
           </select>
         </label>
+        <label id="start-page-wrap" hidden>
+          Start at page
+          <input id="start_page" name="start_page" type="number" min="1" step="1" value="1" />
+        </label>
         <div class="actions">
           <button type="submit" id="start-btn">Start scraping</button>
           <button type="button" id="stop-btn" class="secondary" disabled>Stop</button>

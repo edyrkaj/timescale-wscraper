@@ -349,7 +349,10 @@ mod tests {
         let result = message_content(&text).expect("content");
         println!("  calculator reply: {result}");
         let lower = result.to_ascii_lowercase();
-        assert!(lower.contains("13"), "reply did not mention calculator: {result}");
+        assert!(
+            lower.contains("13"),
+            "reply did not mention calculator: {result}"
+        );
     }
 
     #[test]

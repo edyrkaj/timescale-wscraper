@@ -62,6 +62,38 @@ impl Db {
 
         sqlx::query(
             r#"
+            ALTER TABLE scrape_jobs
+            ADD COLUMN IF NOT EXISTS start_page INT NOT NULL DEFAULT 1
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE scrape_jobs
+            ADD COLUMN IF NOT EXISTS resume_page INT
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Runs that hit the 50-page cap before resume_page existed should continue at the next page.
+        sqlx::query(
+            r#"
+            UPDATE scrape_jobs
+            SET resume_page = start_page + pages_visited
+            WHERE resume_page IS NULL
+              AND pages_visited >= 50
+              AND status = 'completed'
+              AND finished_at < TIMESTAMPTZ '2026-10-14 11:05:00+00'
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
             ALTER TABLE scraped_items
             ADD COLUMN IF NOT EXISTS job_id UUID
             "#,
@@ -238,6 +270,7 @@ impl Db {
         pattern_id: Option<Uuid>,
         use_ai: bool,
         ai_provider: Option<&str>,
+        start_page: i32,
     ) -> Result<ScrapeJob> {
         let id = Uuid::new_v4();
         let resolved_pattern = if use_ai {
@@ -260,8 +293,8 @@ impl Db {
 
         let job = sqlx::query_as::<_, ScrapeJob>(
             r#"
-            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id, use_ai, ai_provider)
-            VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7)
+            INSERT INTO scrape_jobs (id, listing_url, from_date, to_date, status, pattern_id, use_ai, ai_provider, start_page)
+            VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8)
             RETURNING *
             "#,
         )
@@ -272,6 +305,7 @@ impl Db {
         .bind(resolved_pattern)
         .bind(use_ai)
         .bind(provider)
+        .bind(start_page.max(1))
         .fetch_one(&self.pool)
         .await?;
         Ok(job)
@@ -347,6 +381,7 @@ impl Db {
         scraped_count: i32,
         pages_visited: i32,
         last_error: Option<&str>,
+        resume_page: Option<i32>,
     ) -> Result<ScrapeJob> {
         let job = sqlx::query_as::<_, ScrapeJob>(
             r#"
@@ -355,6 +390,7 @@ impl Db {
                 scraped_count = $3,
                 pages_visited = $4,
                 last_error = $5,
+                resume_page = $6,
                 finished_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -365,6 +401,7 @@ impl Db {
         .bind(scraped_count)
         .bind(pages_visited)
         .bind(last_error)
+        .bind(resume_page)
         .fetch_one(&self.pool)
         .await?;
         Ok(job)

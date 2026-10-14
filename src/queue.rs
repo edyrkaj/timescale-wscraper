@@ -103,6 +103,7 @@ impl QueueHandle {
                         stats.scraped_count,
                         stats.pages_visited,
                         None,
+                        stats.resume_page,
                     )
                     .await?;
                 self.emit_job(&finished, "Job finished").await;
@@ -116,6 +117,13 @@ impl QueueHandle {
                         job.scraped_count,
                         job.pages_visited,
                         Some(&err.to_string()),
+                        if job.pages_visited > 0 {
+                            Some(job.start_page.max(1) + job.pages_visited)
+                        } else if job.start_page > 1 {
+                            Some(job.start_page)
+                        } else {
+                            None
+                        },
                     )
                     .await?;
                 self.emit_job(&finished, &format!("Job failed: {err}"))
@@ -168,6 +176,7 @@ impl QueueHandle {
             pattern_cfg.as_ref(),
             job.use_ai,
             ai_provider,
+            job.start_page.max(1),
             token.clone(),
             |items, scraped_count, pages_visited| {
                 let db = db.clone();

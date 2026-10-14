@@ -45,6 +45,28 @@ async function diagnostics(page) {
   }));
 }
 
+const STILL_LOADING = ["po ngarkohen", "loading…", "loading...", "please wait", "duke u ngarkuar"];
+
+async function waitForSettledText(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  let stableSince = 0;
+  while (Date.now() < deadline) {
+    const sample = await page.evaluate(() =>
+      (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 6000)
+    );
+    const loading = STILL_LOADING.some((phrase) => sample.toLowerCase().includes(phrase));
+    if (!loading && sample.length > 80 && sample === last) {
+      if (!stableSince) stableSince = Date.now();
+      if (Date.now() - stableSince >= 1200) return;
+    } else {
+      stableSince = 0;
+      last = sample;
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
 async function waitForListing(page, selector, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -166,13 +188,198 @@ async function scrapeList(body) {
   }
 }
 
-async function fetchPage(body) {
-  const url = body.url;
-  if (!url) throw Object.assign(new Error("url is required"), { status: 400 });
+const sessions = new Map();
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
-  const timeoutMs = Number(body.timeout_ms) || 90_000;
-  const waitMs = Number(body.wait_ms) || 2000;
+function sweepSessions() {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.lastUsed < SESSION_TTL_MS) continue;
+    sessions.delete(id);
+    session.context.close().catch(() => {});
+  }
+}
 
+function releaseSession(id) {
+  const session = sessions.get(id);
+  if (!session) return;
+  sessions.delete(id);
+  session.context.close().catch(() => {});
+}
+
+async function readPage(page) {
+  return page.evaluate(() => {
+    const text = (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 80_000);
+    const seen = new Set();
+    const links = [];
+    for (const a of document.querySelectorAll("a[href]")) {
+      const href = a.href;
+      if (!href || seen.has(href)) continue;
+      if (href.startsWith("javascript:") || href.startsWith("mailto:")) continue;
+      seen.add(href);
+      links.push({
+        text: ((a.innerText || a.textContent || "").trim()).slice(0, 160),
+        href,
+      });
+      if (links.length >= 400) break;
+    }
+    const hasNext = [...document.querySelectorAll("button, a")].some((el) => {
+      const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+      const label = (el.innerText || el.textContent || "").trim().toLowerCase();
+      const disabled =
+        el.disabled ||
+        el.getAttribute("aria-disabled") === "true" ||
+        String(el.className || "").includes("Mui-disabled");
+      if (disabled) return false;
+      if (aria.includes("next page") || aria.includes("faqja tjetër") || aria === "next") return true;
+      return ["next", "next page", ">", "›", "»", "tjetër", "faqja tjetër"].includes(label);
+    });
+    return {
+      final_url: location.href || "",
+      title: document.title || "",
+      text,
+      links,
+      has_next: hasNext,
+    };
+  });
+}
+
+async function listingPageNumber(page) {
+  return page.evaluate(() => {
+    const selected = document.querySelector("button[aria-current='page'], button.Mui-selected");
+    if (selected && /^\d+$/.test((selected.innerText || "").trim())) {
+      return Number(selected.innerText.trim());
+    }
+    const text = document.body && document.body.innerText ? document.body.innerText : "";
+    const match = text.match(/(\d+)\s*-\s*(\d+)\s+nga\s+\d+/);
+    if (!match) return 1;
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const size = Math.max(1, end - start + 1);
+    return Math.floor((start - 1) / size) + 1;
+  });
+}
+
+async function waitForPageChange(page, before) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const now = await page.evaluate(() =>
+      (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 1800)
+    );
+    const loading = STILL_LOADING.some((phrase) => now.toLowerCase().includes(phrase));
+    if (!loading && now !== before && now.length > 80) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  await waitForSettledText(page, 15_000);
+}
+
+async function jumpToListingPage(page, target) {
+  target = Math.max(1, Number(target) || 1);
+  if (target === 1) return;
+  for (let step = 0; step < 40; step++) {
+    const current = await listingPageNumber(page);
+    if (current === target) return;
+    const before = await page.evaluate(() =>
+      (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 1800)
+    );
+    const moved = await page.evaluate(({ target, current }) => {
+      const buttons = [...document.querySelectorAll("button")];
+      const enabled = (el) =>
+        !(el.disabled || el.getAttribute("aria-disabled") === "true" || String(el.className || "").includes("Mui-disabled"));
+      const numbered = [];
+      for (const el of buttons) {
+        if (!enabled(el)) continue;
+        const aria = el.getAttribute("aria-label") || "";
+        const match = aria.match(/go to page (\d+)/i);
+        const label = (el.innerText || "").trim();
+        const n = match ? Number(match[1]) : /^\d+$/.test(label) ? Number(label) : null;
+        if (n && n !== current) numbered.push({ n, el });
+      }
+      const exact = numbered.find((item) => item.n === target);
+      if (exact) {
+        exact.el.click();
+        return exact.n;
+      }
+      const clickCloser = (toward, shortcut) => {
+        if (shortcut && toward) {
+          const viaShortcut = Math.abs(shortcut.n - target);
+          const viaToward = Math.abs(toward.n - target);
+          if (viaShortcut < viaToward) {
+            shortcut.el.click();
+            return shortcut.n;
+          }
+        }
+        const pick = toward || shortcut;
+        if (!pick) return 0;
+        pick.el.click();
+        return pick.n;
+      };
+      if (current < target) {
+        const higher = numbered.filter((item) => item.n > current).sort((a, b) => a.n - b.n);
+        const toward = higher.filter((item) => item.n <= target).pop() || null;
+        const shortcut = higher.find((item) => item.n > target) || null;
+        const picked = clickCloser(toward, shortcut);
+        if (picked) return picked;
+        const next = buttons.find((el) => enabled(el) && (el.getAttribute("aria-label") || "").toLowerCase().includes("next page"));
+        if (next) {
+          next.click();
+          return current + 1;
+        }
+      } else {
+        const lower = numbered.filter((item) => item.n < current).sort((a, b) => b.n - a.n);
+        const toward = lower.filter((item) => item.n >= target).pop() || null;
+        const shortcut = lower.find((item) => item.n < target) || null;
+        const picked = clickCloser(toward, shortcut);
+        if (picked) return picked;
+        const prev = buttons.find((el) => enabled(el) && (el.getAttribute("aria-label") || "").toLowerCase().includes("previous page"));
+        if (prev) {
+          prev.click();
+          return current - 1;
+        }
+      }
+      return 0;
+    }, { target, current });
+    if (!moved) {
+      throw Object.assign(new Error(`could not open listing page ${target} (stopped on page ${current})`), {
+        status: 422,
+      });
+    }
+    await waitForPageChange(page, before);
+  }
+  const current = await listingPageNumber(page);
+  if (current !== target) {
+    throw Object.assign(new Error(`could not open listing page ${target} (stopped on page ${current})`), {
+      status: 422,
+    });
+  }
+}
+
+async function clickNextPage(page) {
+  const before = await page.evaluate(() =>
+    (document.body && document.body.innerText ? document.body.innerText : "").slice(0, 1800)
+  );
+  const clicked = await page.evaluate(() => {
+    const next = [...document.querySelectorAll("button, a")].find((el) => {
+      const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+      const label = (el.innerText || el.textContent || "").trim().toLowerCase();
+      const disabled =
+        el.disabled ||
+        el.getAttribute("aria-disabled") === "true" ||
+        String(el.className || "").includes("Mui-disabled");
+      if (disabled) return false;
+      if (aria.includes("next page") || aria.includes("faqja tjetër") || aria === "next") return true;
+      return ["next", "next page", ">", "›", "»", "tjetër", "faqja tjetër"].includes(label);
+    });
+    if (!next) return false;
+    next.click();
+    return true;
+  });
+  if (!clicked) return false;
+  await waitForPageChange(page, before);
+  return true;
+}
+
+async function openListing(url, timeoutMs, waitMs) {
   const b = await getBrowser();
   const context = await b.newContext({
     userAgent: UA,
@@ -183,11 +390,13 @@ async function fetchPage(body) {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
   });
   const page = await context.newPage();
-
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     await new Promise((r) => setTimeout(r, waitMs));
     const { ready, diag } = await waitForListing(page, "body", timeoutMs);
+    if (ready && !looksLikeCloudflare(diag)) {
+      await waitForSettledText(page, Math.min(timeoutMs, 25_000));
+    }
     if (!ready || looksLikeCloudflare(diag)) {
       const err = new Error(
         `Cloudflare challenge blocked page fetch for ${url}. Diagnostics: ${JSON.stringify(diag)}`
@@ -195,35 +404,63 @@ async function fetchPage(body) {
       err.status = 503;
       throw err;
     }
-
-    return page.evaluate(() => {
-      const text = (document.body && document.body.innerText ? document.body.innerText : "").slice(
-        0,
-        80_000
-      );
-      const seen = new Set();
-      const links = [];
-      for (const a of document.querySelectorAll("a[href]")) {
-        const href = a.href;
-        if (!href || seen.has(href)) continue;
-        if (href.startsWith("javascript:") || href.startsWith("mailto:")) continue;
-        seen.add(href);
-        links.push({
-          text: ((a.innerText || a.textContent || "").trim()).slice(0, 160),
-          href,
-        });
-        if (links.length >= 400) break;
-      }
-      return {
-        final_url: location.href || "",
-        title: document.title || "",
-        text,
-        links,
-      };
-    });
-  } finally {
+    return { context, page };
+  } catch (err) {
     await context.close().catch(() => {});
+    throw err;
   }
+}
+
+async function fetchPage(body) {
+  sweepSessions();
+  if (body.session_id && body.release) {
+    releaseSession(String(body.session_id));
+    return { final_url: "", title: "", text: "", links: [], has_next: false, session_id: null };
+  }
+
+  if (body.session_id && body.next) {
+    const session = sessions.get(String(body.session_id));
+    if (!session) {
+      throw Object.assign(new Error("listing page session expired; start again from the first page"), {
+        status: 410,
+      });
+    }
+    session.lastUsed = Date.now();
+    const moved = await clickNextPage(session.page);
+    const snap = await readPage(session.page);
+    snap.session_id = String(body.session_id);
+    if (!moved) snap.has_next = false;
+    if (!snap.has_next) {
+      releaseSession(String(body.session_id));
+      snap.session_id = null;
+    }
+    return snap;
+  }
+
+  const url = body.url;
+  if (!url) throw Object.assign(new Error("url is required"), { status: 400 });
+  const timeoutMs = Number(body.timeout_ms) || 90_000;
+  const waitMs = Number(body.wait_ms) || 2000;
+  const opened = await openListing(url, timeoutMs, waitMs);
+  const startPage = Math.max(1, Number(body.start_page) || 1);
+  if (startPage > 1) {
+    try {
+      await jumpToListingPage(opened.page, startPage);
+    } catch (err) {
+      await opened.context.close().catch(() => {});
+      throw err;
+    }
+  }
+  const snap = await readPage(opened.page);
+  if (!snap.has_next) {
+    await opened.context.close().catch(() => {});
+    snap.session_id = null;
+    return snap;
+  }
+  const id = crypto.randomUUID();
+  sessions.set(id, { context: opened.context, page: opened.page, lastUsed: Date.now() });
+  snap.session_id = id;
+  return snap;
 }
 
 function readJson(req) {

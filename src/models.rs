@@ -90,6 +90,13 @@ pub struct ScrapeJob {
     #[serde(default)]
     pub use_ai: bool,
     pub ai_provider: Option<String>,
+    #[serde(default = "default_start_page")]
+    pub start_page: i32,
+    pub resume_page: Option<i32>,
+}
+
+fn default_start_page() -> i32 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +109,8 @@ pub struct CreateJobRequest {
     pub use_ai: bool,
     #[serde(default)]
     pub ai_provider: Option<String>,
+    #[serde(default = "default_start_page")]
+    pub start_page: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -271,4 +280,6 @@ pub struct ProgressEvent {
 pub struct ScrapeStats {
     pub scraped_count: i32,
     pub pages_visited: i32,
+    /// Next listing page when this run stopped with more pages left.
+    pub resume_page: Option<i32>,
 }

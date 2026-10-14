@@ -47,6 +47,10 @@ pub struct FetchedPage {
     pub text: String,
     pub links: Vec<PageLink>,
     pub error: Option<String>,
+    /// Browser session kept open when the listing turns pages with a button.
+    pub session_id: Option<String>,
+    /// A next-page control is present and enabled.
+    pub has_next: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -120,7 +124,14 @@ pub fn strip_json_fences(raw: &str) -> &str {
         .strip_suffix("```")
         .unwrap_or(without_open)
         .trim();
-    let start = without_close.find('{').unwrap_or(0);
+    let brace = without_close.find('{');
+    let bracket = without_close.find('[');
+    let start = match (brace, bracket) {
+        (Some(b), Some(k)) => b.min(k),
+        (Some(b), None) => b,
+        (None, Some(k)) => k,
+        (None, None) => 0,
+    };
     &without_close[start..]
 }
 
@@ -295,6 +306,12 @@ pub fn parse_ai_json(raw: &str) -> Result<AiPageExtract> {
     if let Ok(parsed) = serde_json::from_str::<AiPageExtract>(stripped) {
         return Ok(parsed);
     }
+    if let Ok(items) = serde_json::from_str::<Vec<AiJobItem>>(stripped) {
+        return Ok(AiPageExtract {
+            items,
+            next_page_url: None,
+        });
+    }
     let repaired = repair_truncated_json(stripped);
     serde_json::from_str(&repaired).map_err(|err| {
         anyhow!(
@@ -361,6 +378,9 @@ pub fn filter_extract(
 const VLLM_CHUNK_LINKS: usize = 8;
 const VLLM_MAX_CANDIDATES: usize = 48;
 const VLLM_CHUNK_SYSTEM: &str = "You extract job listings from a short link list. Reply with JSON only, no markdown. Schema: {\"items\":[{\"title\":\"\",\"url\":\"https://...\",\"published_at\":\"YYYY-MM-DD or null\"}]}. One compact single-line object per job link. Skip navigation, login, filters, and the listing page itself. Use absolute URLs. Omit description.";
+const VLLM_TEXT_SYSTEM: &str = "You extract job listings from rendered page text. Reply with JSON only, no markdown. Schema: {\"items\":[{\"title\":\"\",\"company\":null,\"location\":null,\"url\":\"\",\"published_at\":null}]}. Jobs may be consecutive lines of title, company, and place with no link. Skip menus, filters, and pagination numbers. Leave url empty when the job has no link. Return at most 10 jobs.";
+const VLLM_TEXT_CHUNK_CHARS: usize = 2400;
+const VLLM_TEXT_MAX_CHUNKS: usize = 3;
 
 pub async fn extract_jobs_from_page(
     cfg: &LlmConfig,
@@ -398,9 +418,13 @@ async fn extract_vllm_in_chunks(
         url = listing_url,
         page_links = page.links.len(),
         candidates = candidates.len(),
+        text_chars = page.text.chars().count(),
         page_title = %page.title,
         "vLLM page links"
     );
+    if page.text.trim().chars().count() >= 200 {
+        return extract_vllm_from_text(cfg, listing_url, from_date, to_date, page).await;
+    }
     if candidates.is_empty() {
         let user = build_user_prompt(listing_url, from_date, to_date, page);
         return VllmProvider::extract(cfg, system_prompt(), &user).await;
@@ -416,6 +440,95 @@ async fn extract_vllm_in_chunks(
         items,
         next_page_url: None,
     })
+}
+
+async fn extract_vllm_from_text(
+    cfg: &LlmConfig,
+    listing_url: &str,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    page: &FetchedPage,
+) -> Result<AiPageExtract> {
+    let mut items = Vec::new();
+    for chunk in page_text_chunks(&page.text) {
+        let user = format!(
+            "Listing URL: {listing_url}\nDate window (inclusive): {from_date} to {to_date}\n\nPage text:\n{chunk}"
+        );
+        let extract = VllmProvider::extract(cfg, VLLM_TEXT_SYSTEM, &user).await?;
+        items.extend(extract.items);
+    }
+    fill_missing_job_urls(listing_url, &mut items);
+    Ok(AiPageExtract {
+        items,
+        next_page_url: None,
+    })
+}
+
+fn page_text_chunks(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if text.chars().count() <= VLLM_TEXT_CHUNK_CHARS {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for block in text.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        if !current.is_empty()
+            && current.chars().count() + block.chars().count() + 2 > VLLM_TEXT_CHUNK_CHARS
+        {
+            chunks.push(std::mem::take(&mut current));
+            if chunks.len() >= VLLM_TEXT_MAX_CHUNKS {
+                return chunks;
+            }
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(block);
+    }
+    if !current.is_empty() && chunks.len() < VLLM_TEXT_MAX_CHUNKS {
+        chunks.push(current);
+    }
+    chunks
+}
+
+pub fn fill_missing_job_urls(listing_url: &str, items: &mut [AiJobItem]) {
+    let base = listing_url.trim_end_matches('/');
+    for item in items.iter_mut() {
+        if !item.url.trim().is_empty() {
+            continue;
+        }
+        let anchor = job_anchor(&item.title, item.company.as_deref());
+        if anchor.is_empty() {
+            continue;
+        }
+        item.url = format!("{base}#job-{anchor}");
+    }
+}
+
+fn job_anchor(title: &str, company: Option<&str>) -> String {
+    let raw = format!("{} {}", title, company.unwrap_or(""));
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in raw.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+        if out.chars().count() >= 80 {
+            break;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn build_chunk_prompt(
@@ -623,10 +736,51 @@ mod tests {
                 },
             ],
             error: None,
+            session_id: None,
+            has_next: false,
         };
         let found = candidate_job_links("https://jobs.example/list", &page);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].href, "https://jobs.example/j/9");
+    }
+
+    #[test]
+    fn parses_bare_job_array() {
+        let raw = r#"[{"title":"Shites","company":"EURO MARKET","location":"Korçë"}]"#;
+        let parsed = parse_ai_json(raw).expect("array");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].title, "Shites");
+        assert!(parsed.items[0].url.is_empty());
+    }
+
+    #[test]
+    fn fills_missing_job_url_from_title() {
+        let mut items = vec![
+            AiJobItem {
+                title: "Shites".into(),
+                url: String::new(),
+                company: Some("EURO MARKET".into()),
+                location: Some("Korçë".into()),
+                salary: None,
+                description: None,
+                published_at: None,
+            },
+            AiJobItem {
+                title: "Shofer".into(),
+                url: "https://jobs.example/j/2".into(),
+                company: Some("KRETA".into()),
+                location: None,
+                salary: None,
+                description: None,
+                published_at: None,
+            },
+        ];
+        fill_missing_job_urls("https://www.puna.gov.al/kerko", &mut items);
+        assert_eq!(
+            items[0].url,
+            "https://www.puna.gov.al/kerko#job-shites-euro-market"
+        );
+        assert_eq!(items[1].url, "https://jobs.example/j/2");
     }
 
     #[test]

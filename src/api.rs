@@ -40,6 +40,7 @@ pub async fn create_job(
             body.pattern_id,
             body.use_ai,
             body.ai_provider.as_deref(),
+            body.start_page,
         )
         .await
     {
@@ -51,15 +52,21 @@ pub async fn create_job(
                 scraped_count: 0,
                 status: "queued".into(),
                 message: format!(
-                    "Enqueued job {}{}",
+                    "Enqueued job {}{}{}",
                     job.id,
                     if job.use_ai {
                         match job.ai_provider.as_deref() {
                             Some("gemini") => " (AI scrape · Gemini)",
+                            Some("vllm") => " (AI scrape · vLLM)",
                             _ => " (AI scrape · Anthropic)",
                         }
                     } else {
                         ""
+                    },
+                    if job.start_page > 1 {
+                        format!(" from page {}", job.start_page)
+                    } else {
+                        String::new()
                     }
                 ),
             });
@@ -115,6 +122,7 @@ pub async fn restart_job(
                 job.pattern_id,
                 job.use_ai,
                 job.ai_provider.as_deref(),
+                job.start_page,
             )
             .await
         {
@@ -133,6 +141,59 @@ pub async fn restart_job(
             Json(serde_json::json!({"error": "job not found"})),
         )
             .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn continue_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let job = match state.db.get_job(id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "job not found"})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let Some(start_page) = job.resume_page.filter(|page| *page > 1) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "this scrape has no further page to continue from"})),
+        )
+            .into_response();
+    };
+    match state
+        .db
+        .create_job(
+            &job.listing_url,
+            job.from_date,
+            job.to_date,
+            job.pattern_id,
+            job.use_ai,
+            job.ai_provider.as_deref(),
+            start_page,
+        )
+        .await
+    {
+        Ok(new_job) => {
+            state.queue.notify();
+            (axum::http::StatusCode::CREATED, Json(new_job)).into_response()
+        }
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),

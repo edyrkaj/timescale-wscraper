@@ -114,6 +114,7 @@ pub async fn scrape_listing<F, Fut>(
     pattern: Option<&PatternConfig>,
     use_ai: bool,
     ai_provider: crate::models::AiProvider,
+    start_page: i32,
     cancel: CancellationToken,
     on_batch: F,
 ) -> Result<ScrapeStats>
@@ -128,6 +129,7 @@ where
             from_date,
             to_date,
             ai_provider,
+            start_page,
             cancel,
             on_batch,
         )
@@ -166,6 +168,7 @@ async fn scrape_with_ai<F, Fut>(
     from_date: NaiveDate,
     to_date: NaiveDate,
     ai_provider: crate::models::AiProvider,
+    start_page: i32,
     cancel: CancellationToken,
     mut on_batch: F,
 ) -> Result<ScrapeStats>
@@ -177,72 +180,120 @@ where
     let source_id = source_id_from_url(listing_url)?;
     let origin = Url::parse(listing_url).context("invalid listing URL")?;
 
+    let start_page = start_page.max(1);
     let mut stats = ScrapeStats::default();
     let mut current = listing_url.to_string();
     let mut visited = std::collections::HashSet::new();
     let mut seen_jobs = std::collections::HashSet::new();
+    let mut session_id: Option<String> = None;
+    let mut step_next = false;
 
-    while stats.pages_visited < MAX_PAGES && stats.scraped_count < MAX_ITEMS {
-        if cancel.is_cancelled() {
-            break;
-        }
-        if !visited.insert(current.clone()) {
-            break;
-        }
-
-        stats.pages_visited += 1;
-        info!(url = %current, page = stats.pages_visited, "AI scrape: fetching page");
-        let page = fetch_page_via_playwright(&current, &cancel).await?;
-        let extract =
-            crate::ai::extract_jobs_from_page(&cfg, listing_url, from_date, to_date, &page).await?;
-        let next_raw = extract.next_page_url.clone().or_else(|| {
-            crate::ai::listing_next_url(&page.final_url, &page.links)
-                .or_else(|| crate::ai::listing_next_url(&current, &page.links))
-        });
-        let (kept, saw_older) = crate::ai::filter_extract(extract, from_date, to_date);
-
-        let mut batch = Vec::new();
-        for (item, published) in kept {
-            if !seen_jobs.insert(item.url.clone()) {
-                continue;
-            }
-            batch.push(ScrapedItem {
-                source_id: source_id.clone(),
-                external_id: external_id_for_url(&item.url),
-                item_timestamp: published.map(date_to_utc).unwrap_or_else(Utc::now),
-                title: item.title,
-                url: item.url,
-                company: item.company,
-                location: item.location,
-                salary: item.salary,
-                description: item.description,
-                job_id: None,
-                job_inserted_at: None,
-            });
-            if stats.scraped_count + batch.len() as i32 >= MAX_ITEMS {
+    let result = async {
+        while stats.pages_visited < MAX_PAGES && stats.scraped_count < MAX_ITEMS {
+            if cancel.is_cancelled() {
+                if stats.pages_visited > 0 {
+                    stats.resume_page = Some(start_page + stats.pages_visited);
+                }
                 break;
             }
-        }
+            let listing_page = start_page + stats.pages_visited;
+            let visit_key = format!("{current}#page={listing_page}");
+            if !visited.insert(visit_key) {
+                break;
+            }
 
-        let this_page_empty = batch.is_empty();
-        stats.scraped_count += batch.len() as i32;
-        on_batch(batch, stats.scraped_count, stats.pages_visited).await?;
+            stats.pages_visited += 1;
+            info!(url = %current, page = listing_page, pager = step_next, "AI scrape: fetching page");
+            let page = fetch_page_via_playwright(
+                &current,
+                session_id.as_deref(),
+                step_next,
+                false,
+                if step_next { 1 } else { start_page },
+                &cancel,
+            )
+            .await?;
+            session_id = page.session_id.clone();
+            let extract = crate::ai::extract_jobs_from_page(
+                &cfg,
+                listing_url,
+                from_date,
+                to_date,
+                &page,
+            )
+            .await?;
+            let next_raw = extract.next_page_url.clone().or_else(|| {
+                crate::ai::listing_next_url(&page.final_url, &page.links)
+                    .or_else(|| crate::ai::listing_next_url(&current, &page.links))
+            });
+            let (kept, saw_older) = crate::ai::filter_extract(extract, from_date, to_date);
 
-        if this_page_empty && saw_older {
+            let mut batch = Vec::new();
+            for (item, published) in kept {
+                if !seen_jobs.insert(item.url.clone()) {
+                    continue;
+                }
+                batch.push(ScrapedItem {
+                    source_id: source_id.clone(),
+                    external_id: external_id_for_url(&item.url),
+                    item_timestamp: published.map(date_to_utc).unwrap_or_else(Utc::now),
+                    title: item.title,
+                    url: item.url,
+                    company: item.company,
+                    location: item.location,
+                    salary: item.salary,
+                    description: item.description,
+                    job_id: None,
+                    job_inserted_at: None,
+                });
+                if stats.scraped_count + batch.len() as i32 >= MAX_ITEMS {
+                    break;
+                }
+            }
+
+            let this_page_empty = batch.is_empty();
+            stats.scraped_count += batch.len() as i32;
+            on_batch(batch, stats.scraped_count, stats.pages_visited).await?;
+
+            if this_page_empty && saw_older {
+                break;
+            }
+
+            if let Some(next) =
+                resolve_same_origin_next(&origin, &page.final_url, next_raw.as_deref())
+            {
+                if visited.contains(&next) {
+                    break;
+                }
+                if let Some(id) = session_id.take() {
+                    let _ = fetch_page_via_playwright(&current, Some(&id), false, true, 1, &cancel).await;
+                }
+                step_next = false;
+                current = next;
+                continue;
+            }
+
+            if page.has_next && session_id.is_some() {
+                let next_listing_page = start_page + stats.pages_visited;
+                if stats.pages_visited >= MAX_PAGES || stats.scraped_count >= MAX_ITEMS {
+                    stats.resume_page = Some(next_listing_page);
+                    info!(page = next_listing_page, "AI scrape: page cap reached; resume from this page");
+                    break;
+                }
+                info!(page = next_listing_page, "AI scrape: clicking next page");
+                step_next = true;
+                continue;
+            }
             break;
         }
-
-        let Some(next) = resolve_same_origin_next(&origin, &page.final_url, next_raw.as_deref())
-        else {
-            break;
-        };
-        if visited.contains(&next) {
-            break;
-        }
-        current = next;
+        Ok(stats)
     }
+    .await;
 
-    Ok(stats)
+    if let Some(id) = session_id.take() {
+        let _ = fetch_page_via_playwright(&current, Some(&id), false, true, 1, &cancel).await;
+    }
+    result
 }
 
 fn resolve_same_origin_next(listing: &Url, final_url: &str, next: Option<&str>) -> Option<String> {
@@ -259,6 +310,10 @@ fn resolve_same_origin_next(listing: &Url, final_url: &str, next: Option<&str>) 
 
 async fn fetch_page_via_playwright(
     url: &str,
+    session_id: Option<&str>,
+    next: bool,
+    release: bool,
+    start_page: i32,
     cancel: &CancellationToken,
 ) -> Result<crate::ai::FetchedPage> {
     let base = std::env::var("PLAYWRIGHT_URL")
@@ -273,6 +328,10 @@ async fn fetch_page_via_playwright(
         "url": url,
         "wait_ms": 2000,
         "timeout_ms": 90_000,
+        "session_id": session_id,
+        "next": next,
+        "release": release,
+        "start_page": start_page.max(1),
     });
     let send = client.post(&endpoint).json(&payload).send();
     let res = tokio::select! {

@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/jobs/stream", get(api::job_stream))
         .route("/api/jobs/{id}/stop", post(api::stop_job))
         .route("/api/jobs/{id}/restart", post(api::restart_job))
+        .route("/api/jobs/{id}/continue", post(api::continue_job))
         .route("/api/items", get(api::list_items))
         .route(
             "/api/patterns",

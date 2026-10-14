@@ -59,9 +59,7 @@ Enable **AI Scraper** and pick a provider from the dropdown (**Anthropic**, **Ge
 Local Qwen runs in vLLM outside Compose. On a 32 GB Mac, use Qwen3-8B. Do not pass `--api-key`. The app calls `POST /v1/chat/completions` with no OpenAI key (`VLLM_BASE_URL`, `VLLM_MODEL` in `.env.example`).
 
 ```bash
-vllm serve Qwen/Qwen3-8B \
-  --max-model-len 4096 \
-  --gpu-memory-utilization 0.7
+make vllm
 ```
 
 The Tirana pattern is seeded automatically. It uses the public list API, then opens each detail page for title/company/description enrichment.

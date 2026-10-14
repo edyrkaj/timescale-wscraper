@@ -14,6 +14,8 @@ const patternConfig = document.getElementById("pattern_config");
 const useAi = document.getElementById("use_ai");
 const aiProviderWrap = document.getElementById("ai-provider-wrap");
 const aiProvider = document.getElementById("ai_provider");
+const startPageWrap = document.getElementById("start-page-wrap");
+const startPageInput = document.getElementById("start_page");
 const patternsSection = document.getElementById("patterns-section");
 const patternsToggle = document.getElementById("patterns-toggle");
 const patternsBody = document.getElementById("patterns-body");
@@ -52,6 +54,8 @@ function syncAiToggle() {
   if (on) patternSelect.value = "";
   aiProviderWrap.hidden = !on;
   aiProvider.disabled = !on;
+  startPageWrap.hidden = !on;
+  startPageInput.disabled = !on;
 }
 
 useAi.addEventListener("change", syncAiToggle);
@@ -301,6 +305,7 @@ form.addEventListener("submit", async (e) => {
     pattern_id: patternId,
     use_ai: useAi.checked,
     ai_provider: useAi.checked ? aiProvider.value : null,
+    start_page: useAi.checked ? Math.max(1, Number(startPageInput.value) || 1) : 1,
   };
   const res = await fetch(apiUrl("/api/jobs"), {
     method: "POST",
@@ -426,9 +431,32 @@ async function refreshJobs() {
     const patternName = job.use_ai
       ? `AI · ${job.ai_provider || "anthropic"}`
       : patternsCache.find((p) => p.id === job.pattern_id)?.name || (job.pattern_id ? job.pattern_id.slice(0, 8) : "heuristic");
-    li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${job.pages_visited} pages · ${escapeHtml(patternName)}</div>
+    const fromPage = job.start_page > 1 ? job.start_page : 1;
+    const throughPage = job.pages_visited > 0 ? fromPage + job.pages_visited - 1 : fromPage;
+    const pageLabel = job.pages_visited > 0 ? `pages ${fromPage}–${throughPage}` : "0 pages";
+    li.innerHTML = `<div><strong>${job.status}</strong> · ${job.scraped_count} items · ${pageLabel} · ${escapeHtml(patternName)}</div>
       <div class="meta">${escapeHtml(job.listing_url)}</div>
       <div class="meta">${job.from_date} → ${job.to_date} · ${job.id}</div>`;
+    if (job.resume_page) {
+      const cont = document.createElement("button");
+      cont.type = "button";
+      cont.className = "secondary";
+      cont.textContent = `Continue from page ${job.resume_page}`;
+      cont.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        const res = await fetch(apiUrl(`/api/jobs/${job.id}/continue`), { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          message.textContent = data.error || "Continue failed";
+          return;
+        }
+        selectedJobId = data.id;
+        message.textContent = `Continuing from page ${data.start_page} as ${data.id}`;
+        restartBtn.disabled = false;
+        await refreshJobs();
+      });
+      li.appendChild(cont);
+    }
     li.addEventListener("click", () => {
       selectedJobId = job.id;
       restartBtn.disabled = false;
